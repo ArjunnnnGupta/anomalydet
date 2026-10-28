@@ -32,25 +32,29 @@ Review 2's planned items were Kafka streaming integration and real-time alerting
 
 ```
  CICIDS2017 CSVs (8 days, 2.83M flows)
-        │  replay producer: event-time paced, keyed by Source IP, idempotent, lz4
+        │  replay producer: event-time paced, keyed by Source IP,
+        │  idempotent, lz4
         ▼
- ┌────────── Apache Kafka (KRaft, no ZooKeeper) ──────────┐
- │  flows.raw (12 partitions) · flows.scored · alerts · DLQ │
- └──────────────────────────┬──────────────────────────────┘
-                            ▼
- ┌──────── Spark Structured Streaming (one app) ───────────┐
- │ Q1 BRONZE  Kafka → Delta: raw records + offsets         │
- │ Q2 SILVER  parse · validate · enrich → Delta            │
- │            bad records → quarantine table + DLQ topic   │
- │ Q3 GOLD    1-min windows per attack type & per host,     │
- │            port-scan candidates → Delta (MERGE)          │
- │ Q4 SCORE   MLlib RandomForest + KMeans → alerts          │
- └──────────────────────────┬──────────────────────────────┘
-          ▼                  ▼                    ▼
-   Delta Lake tables   Kafka alerts topic   SQLite serving cache
-          │                                       │
-   MLlib training job                     Streamlit dashboard
-   (model registry, hot reload)
+┌─────────── Apache Kafka (KRaft, no ZooKeeper) ───────────┐
+│ flows.raw (12 partitions) · flows.scored · alerts · DLQ  │
+└──────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────── Spark Structured Streaming (one app) ──────────┐
+│ Q1 BRONZE  Kafka → Delta: raw records + offsets          │
+│ Q2 SILVER  parse · validate · enrich → Delta             │
+│            bad records → quarantine table + DLQ topic    │
+│ Q3 GOLD    1-min windows per attack type and per host,   │
+│            port-scan candidates → Delta (MERGE)          │
+│ Q4 SCORE   MLlib RandomForest + KMeans → alerts          │
+└──────────────────────────────────────────────────────────┘
+        │                    │                     │
+        ▼                    ▼                     ▼
+ Delta Lake tables    Kafka alerts topic    SQLite serving cache
+        │                                          │
+        ▼                                          ▼
+ MLlib training job                         Streamlit dashboard
+ (model registry, hot reload)
 ```
 
 **Kappa vs. Lambda.** A Lambda architecture keeps a separate batch path and a streaming path. Here there is a single path: every record enters through Kafka, and every table is built by stream processing. Reprocessing means replaying the log (Kafka or a Delta table) through the same code.
@@ -139,16 +143,16 @@ The code is identical in both; only the cluster size changes.
 
 ### 5.1 Model performance
 
-| Metric | Held-out test (162,029 flows) | Live stream (19,985 flows) |
+| Metric | Held-out test (162,029 flows) | Live stream (24,045 flows) |
 |---|---|---|
-| Alert precision (alerts that were real attacks) | **0.992** | **0.995** |
-| Alert recall (real attacks that raised an alert) | **0.996** | **0.991** |
+| Alert precision (alerts that were real attacks) | **0.992** | **0.994** |
+| Alert recall (real attacks that raised an alert) | **0.996** | **0.992** |
 | RandomForest ROC-AUC | 0.9997 | 0.9998 |
-| KMeans anomaly ROC-AUC | 0.709 | 0.786 |
+| KMeans anomaly ROC-AUC | 0.709 | 0.772 |
 | Accuracy (attack family) | 0.995 | — |
-| Macro-F1 (attack family) | 0.907 | 0.598* |
+| Macro-F1 (attack family) | 0.907 | 0.853* |
 
-\*The live macro-F1 comes from a small partial sample in which the rare families have only a handful of flows; the binary precision and recall are unaffected.
+\*The live flows scored so far contain only 8 Bot and 7 Web Attack flows (F1 0.35 and 0.64), which pull the equally-weighted macro average down; every other family scores F1 ≥ 0.994. The binary precision and recall are not affected.
 
 **Per-family results (held-out test):**
 
@@ -165,7 +169,7 @@ The code is identical in both; only the cluster size changes.
 
 The large families are detected almost perfectly. Macro-F1 (0.907) is pulled down by the three rare families. Infiltration has only 8 test flows, so one miss halves its recall.
 
-**Which model fires.** On live traffic, 10,234 alerts came from the RandomForest alone, 120 from both models and 31 from KMeans alone. The supervised model does most of the work, and KMeans adds a safety net for traffic that does not look like anything normal.
+**Which model fires.** Of the alerts on live traffic, 12,445 came from the RandomForest alone, 131 from both models and 48 from KMeans alone (held-out test: 88,601 / 249 / 393). The supervised model does most of the work, and KMeans adds a safety net for traffic that does not look like anything normal.
 
 **Most important features** (RandomForest): destination port, backward packets/s, subflow forward bytes, maximum forward packet length, initial TCP window size, average backward segment size.
 
@@ -173,7 +177,15 @@ The large families are detected almost perfectly. Macro-F1 (0.907) is pulled dow
 
 ### 5.2 Streaming run
 
-On the lite cluster, a demo replay of **30,235 live flows** went through Kafka → bronze → silver → scoring end to end with no data loss, raising **16,872 alerts**. Kafka consumer lag returned to zero once the replay finished.
+On the lite cluster, a demo replay of **30,235 live flows** went through Kafka → bronze → silver → scoring with no memory failures, raising **16,872 alerts** to SQLite and the Kafka `alerts` topic. Kafka consumer lag returned to zero once the replay finished. That run also exposed a bug: after a checkpoint reset, its scored rows were silently skipped by the Delta `gold_scored` table (Section 8). After the fix, a second replay of **4,060 flows** was verified end to end: `gold_scored` grew from 19,985 to 24,045 rows (exactly 4,060).
+
+Fixing the bottlenecks found on the cluster made the stream several times faster:
+
+| Query | Micro-batch time before | After |
+|---|---|---|
+| Scoring | 48–138 s | 12–23 s |
+| Gold per-host windows | 140–363 s | 7–33 s |
+| Gold MERGE scan time | 76–248 s | 4–27 s |
 
 ### 5.3 Dashboard
 
@@ -224,8 +236,9 @@ These problems all came up when running on the real cluster with the full datase
   - spreading the stream over two small executors
   - never running a batch job alongside the stream
   - using the single-broker, single-worker profile for the demo
-* **Slow deduplication.** A MERGE-based duplicate check re-scanned the whole silver table on every micro-batch (about 2.5 minutes per batch). It was replaced with Delta's idempotent append, and the gold MERGEs were given partition-pruning predicates.
+* **Slow deduplication.** A MERGE-based duplicate check re-scanned the whole silver table on every micro-batch (about 2.5 minutes per batch). It was replaced with Delta's idempotent append, and the gold MERGEs were given partition-pruning and file-skipping predicates.
 * **Silently skipped writes after a checkpoint reset.** Delta's idempotent write used the query name as its ID. After a checkpoint reset the batch numbers restarted at 0, so Delta treated them as already written. The ID now includes the streaming query's unique ID, as Delta recommends.
+* **CPU starvation from a Delta default.** Delta rebuilds its transaction-log snapshot with 50 tasks by default, sized for large clusters. On a 2-core worker every micro-batch of every Delta-reading query queued 50 tiny tasks, and scoring waited behind them. Setting `spark.databricks.delta.snapshotPartitions` to 4 removed the starvation.
 * **Python 3.8 in the Spark image.** The official Spark 3.5.3 image ships Python 3.8. Library versions were pinned accordingly, and the code kept 3.8-compatible.
 
 ---

@@ -352,3 +352,17 @@ Ran the stream against a small live sample (`make live LIVE_PCT=2 SPEEDUP=0`, 4,
 - `pytest` → 18 passed. The stream is stopped.
 
 **Still open:** a timed demo rehearsal (`make stream` + `make live SPEEDUP=600`), and `make evaluate-live` on the larger live set (now 24,045 flows) so REPORT.md §5.1 can be updated.
+
+---
+
+## Checkpoint 18: DA3 report refreshed and PDF generated (2026-10-28)
+
+- `make evaluate-live` on all **24,045** scored live flows: precision 0.994, recall 0.992, RF AUC 0.9998, KMeans AUC 0.772, macro-F1 0.853 (the gap is 8 Bot and 7 Web Attack flows; every other family has F1 ≥ 0.994). `make evaluate` (held-out, 162,029 flows) reproduced the training metrics exactly and produced the held-out plots.
+- REPORT.md updated:
+  - live column and footnote in §5.1
+  - which-model-fires counts
+  - §5.2 now states honestly that the 30,235-flow run's scored rows missed `gold_scored` (bug), plus the verified 4,060-flow run and a before/after batch-time table
+  - §8 gains the Delta snapshot-starvation challenge
+  - the architecture diagram is redrawn with aligned borders
+- New `generate_report_da3_pdf.py` builds **Digital_Assignment_3_Report.pdf** (9 pages, A4) from REPORT.md, with DejaVu fonts (arrows, box drawing) and the 4 evaluation figures as an appendix. Every page was rendered and checked. `make report` → DA3, `make report-da2` → old PDF.
+- The PDF itself is git-ignored (`*.pdf`); regenerate it with `make report`.

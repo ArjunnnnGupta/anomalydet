@@ -43,7 +43,7 @@ ARGS       ?=
 
 .PHONY: help setup test build cluster-up cluster-down cluster-ps logs topics topics-describe \
         stream stream-bg stream-logs stream-catchup produce backfill live inject-bad wait train evaluate \
-        evaluate-live maintenance dashboard report reset
+        evaluate-live maintenance dashboard report report-da2 reset
 
 help:
 	@grep -E '^## ' Makefile | sed 's/## //'
@@ -143,8 +143,12 @@ maintenance:
 dashboard:
 	PYTHONPATH=. $(VENV)/bin/streamlit run src/dashboard/app.py
 
-## report           regenerate the (unchanged) Review-2 report PDF from REPORT.md
+## report           build Digital_Assignment_3_Report.pdf from REPORT.md (+ evaluation plots)
 report:
+	$(PY) generate_report_da3_pdf.py
+
+## report-da2       regenerate the old Review-2 PDF (hardcoded text)
+report-da2:
 	$(PY) generate_report_pdf.py
 
 
