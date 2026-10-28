@@ -1,192 +1,167 @@
-# Flow-Level Network Anomaly Detection Platform
+# Kappa Network-Flow Anomaly Detection Platform
 
-> **Big Data Analytics — University Project**  
-> Local build: MacBook Air M2, 8GB unified RAM, Apple Silicon (ARM64)
+> **Big Data Analytics (BCSE402L), VIT Chennai.** A streaming-first big data pipeline over the
+> CICIDS2017 intrusion-detection dataset (2.83M labelled network flows; the demo replays
+> ~1.0M of them: every attack flow plus 20% of the benign ones).
+
+Every record enters through **Apache Kafka**. One always-on **Spark Structured Streaming**
+application builds a **Delta Lake** medallion lakehouse (bronze → silver → gold) continuously.
+**Spark MLlib** trains distributed models on the data the stream wrote, and those models score
+live traffic in real time. The scorer checks the model registry on every micro-batch and swaps in
+a newly registered version without a code change or redeploy.
+
+```
+ CICIDS2017 CSVs ──► replay producer ──► Kafka (KRaft · 12 partitions; 1 broker by default, 3 with LITE=0)
+                     (idempotent, lz4,          │
+                      keyed by Source IP)       ▼
+            ┌──────────── Spark Structured Streaming app (5 queries) ────────────┐
+            │ Q1 bronze ─► Q2 silver ─┬─► Q3a gold: 1-min attack timeline          │
+            │ (raw+offsets) (parse·DQ· ├─► Q3b gold: 1-min per-host profiles        │
+            │               enrich·    │          + port-scan candidates            │
+            │               MERGE)     └─► Q4 scoring (MLlib RF + KMeans, hot reload)│
+            └───────────────┬──────────────────────────┬──────────────────────────┘
+                            ▼                          ▼
+        Delta Lake (ACID · time travel · Z-order)   Kafka flows.scored / alerts / flows.dlq
+                            │                          │
+         MLlib training ◄───┘                          ▼
+         (RandomForest + KMeans, model registry) ─► SQLite serving cache ─► Streamlit dashboard
+```
+
+The full design, with a map from each big data concept to the code that uses it, is in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+Build progress is logged in [CHECKPOINT.md](CHECKPOINT.md).
 
 ---
 
-## Architecture
+## What runs where
 
-```
-cicds.csv
-    │
-    ▼
-┌──────────────────────────────────────────────────────────┐
-│  Phase 1: PySpark — Data Cleaning                        │
-│  (cast types, drop nulls/Inf, drop zero-variance cols)   │
-└───────────────────────┬──────────────────────────────────┘
-                        │ Parquet
-                        ▼
-┌──────────────────────────────────────────────────────────┐
-│  Phase 2: Kafka (KRaft) + Spark Structured Streaming     │
-│  Producer: Parquet rows → JSON → Kafka topic             │
-│  Consumer: Kafka → parse JSON → Parquet sink             │
-└───────────────────────┬──────────────────────────────────┘
-                        │
-                        ▼
-┌──────────────────────────────────────────────────────────┐
-│  Phase 3: PySpark + scikit-learn                         │
-│  Per-flow preprocessing: Inf-cleanup → StandardScaler    │
-│  (no windowing, no groupBy IP — dataset has no IP/time)  │
-└───────────────────────┬──────────────────────────────────┘
-                        │ NumPy arrays
-                        ▼
-┌──────────────────────────────────────────────────────────┐
-│  Phase 4: scikit-learn ML                                │
-│  IsolationForest  — unsupervised per-flow anomaly score  │
-│  RandomForest     — supervised attack-type classification│
-└───────────────────────┬──────────────────────────────────┘
-                        │
-                        ▼
-┌──────────────────────────────────────────────────────────┐
-│  Phase 5: SQLite                                         │
-│  flow_scores table + alerts table                        │
-└───────────────────────┬──────────────────────────────────┘
-                        │
-                        ▼
-┌──────────────────────────────────────────────────────────┐
-│  Phase 6: Streamlit Dashboard                            │
-│  Live alert feed · score histogram · attack type chart   │
-└──────────────────────────────────────────────────────────┘
-```
+| Component | Runs in | UI |
+|---|---|---|
+| Kafka in KRaft mode, no ZooKeeper (1 broker by default; 3 brokers, RF=3 with `LITE=0`) | Docker | — |
+| Kafka UI (topics, partitions, ISR, consumer lag) | Docker | http://localhost:8080 |
+| Spark standalone: 1 master + 1 worker (2 workers with `LITE=0`) | Docker | http://localhost:8081 |
+| Streaming app (driver, client mode) | `spark-master` container | http://localhost:4040 |
+| Training / evaluation / maintenance jobs (run with the stream stopped) | `spark-master` container | http://localhost:4040 |
+| Replay producer, topic admin, dashboard, tests | host (`./venv`) | http://localhost:8501 |
+
+The project folder is mounted at `/opt/app` in every Spark container. It is the shared
+filesystem (the role HDFS or S3 plays on a real cluster) for the Delta tables, checkpoints and model registry.
 
 ---
 
-## Quick Start
+## Quick start
 
-### Prerequisites
-- Python 3.11+ (tested on 3.13)
-- Docker Desktop for Mac (Apple Silicon build) — only needed for Kafka (Phase 2)
+### 1. Prerequisites
+- **Docker Desktop** for Apple Silicon, with Settings → Resources set to **~6 GB memory and 6 CPUs**.
+- **Python 3.12+** and **Java 17**. Java 17 is only needed for the host test suite (`brew install openjdk@17`).
+- About **6 GB of free disk** for Kafka logs, the Delta lake and images.
 
-### 1. Set up environment
+### 2. Dataset
+Download **`GeneratedLabelledFlows.zip`** (the *TrafficLabelling* CSVs that include
+Flow ID, Source/Destination IP, ports and Timestamp) from the
+[UNB CICIDS2017 page](https://www.unb.ca/cic/datasets/ids-2017.html) and unzip the 8 CSVs into:
 
-```bash
-# From the project root
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+```
+data/raw/cicids2017/
+  Monday-WorkingHours.pcap_ISCX.csv
+  Tuesday-WorkingHours.pcap_ISCX.csv
+  ... (8 files)
 ```
 
-### 2. Place the dataset
+The old `cicds.csv` export is not used. It has no timestamps or IPs, and without them event-time
+windows and per-host analytics aren't possible.
 
-Copy `cicds.csv` into `data/raw/`:
+### 3. Build and start the cluster
 ```bash
-cp /path/to/cicds.csv data/raw/cicds.csv
+make setup          # host venv: producer, dashboard, tests
+make build          # Spark 3.5.3 image with Kafka + Delta jars baked in
+make cluster-up     # 1 Kafka broker + Kafka UI + Spark master + 1 worker
+make topics         # create topics, print leader/replicas/ISR per partition
 ```
+**Default is the lite profile** (1 broker, RF=1, 1 worker): on an 8 GB Mac the 3-broker / 2-worker
+cluster kept running out of memory. The full cluster is still there: add `LITE=0` to every target
+(e.g. `make cluster-up LITE=0`) to get 3 brokers with replication (RF=3, min.ISR=2) and 2 workers.
 
-### 3. Run the pipeline phase by phase
-
+### 4. Run the pipeline (Kappa: two passes through Kafka)
 ```bash
-# Phase 1 — Data cleaning (~3–10 min depending on Spark startup + dataset size)
-python src/processing/clean_data.py
+# Terminal 1: the always-on streaming app (all 5 queries)
+make stream
 
-# Phase 3 — Per-flow feature preprocessing
-python src/processing/preprocess_flows.py
+# Terminal 2
+make backfill       # replay ~80% of flows at full speed → stream builds bronze/silver/gold
+make wait           # block until Kafka lag = 0 and silver is idle
+# → now stop the stream in Terminal 1 (Ctrl+C): batch jobs need its memory
+make train          # MLlib on silver → registers model v1
+# → start the stream again in Terminal 1 (make stream); it loads v1 on its first batch
+make live           # replay a 15% sample of the held-out flows (~30K) at 300×, re-based to "now"
+                    # (LIVE_PCT=100 for all ~203K; each run gets its own run_id, so it can be repeated)
 
-# Phase 4 — ML training + evaluation
-python src/ml/train_isolation_forest.py
-python src/ml/train_random_forest.py
-python src/ml/evaluate.py
-
-# Phase 5 — Write alerts to SQLite
-python src/storage/write_alerts.py
-
-# Phase 6 — Dashboard
-streamlit run src/dashboard/app.py
+# Terminal 3
+make dashboard      # http://localhost:8501
 ```
+`train`, `evaluate` and `maintenance` refuse to run while the stream is running: in 6 GB of
+Docker memory there is no room for two Spark drivers. Stop the stream (Ctrl+C), run the job, restart the stream.
 
-### 4. (Optional) Simulated streaming — Phase 2
-
-Requires Docker Desktop running:
+### 5. More to try
 ```bash
-bash scripts/start_kafka.sh
-bash scripts/create_topic.sh
-
-# Terminal A — producer
-python src/ingestion/kafka_producer.py --sample 5000
-
-# Terminal B — consumer (Spark Structured Streaming)
-python src/ingestion/spark_consumer.py
+make inject-bad            # 50 malformed records → silver_quarantine + Kafka flows.dlq
+make train                 # (stream stopped) register v2 → the next `make stream` serves v2
+make evaluate              # metrics + plots on the held-out test split
+make evaluate-live         # metrics on what the live stream actually scored
+make maintenance           # OPTIMIZE / ZORDER, DESCRIBE HISTORY, time travel, schema evolution, VACUUM
+# (full cluster only, LITE=0) docker compose -f docker/docker-compose.yml stop kafka-2   # broker failure: min.ISR=2 keeps it running
 ```
-
-### 5. Verify all phases
-
-```bash
-python tests/test_pipeline.py
-```
+Stop the streaming app with Ctrl+C and start it again: every query resumes from its checkpoint,
+and the idempotent sinks keep the tables free of duplicates.
 
 ---
 
-## Makefile shortcuts
+## Make targets
 
-```bash
-make setup         # create venv + install deps
-make test-spark    # confirm PySpark works
-make kafka-start   # start Kafka via Docker
-make kafka-topic   # create network-flows topic
-make clean-data    # Phase 1
-make preprocess    # Phase 3
-make train-if      # Phase 4a — Isolation Forest
-make train-rf      # Phase 4b — Random Forest
-make evaluate      # Phase 4c — metrics + plots
-make write-alerts  # Phase 5
-make dashboard     # Phase 6
-```
-
----
-
-## Dataset
-
-**cicds.csv** — Kaggle combined CICIDS2017 export.  
-- ~2.8 million rows (network flows)  
-- 52 flow-level statistical features (packet sizes, byte rates, inter-arrival times, TCP flags, etc.)  
-- `Attack Type` column with ~15 classes (BENIGN + various attack types)  
-- **No Source IP, Destination IP, or Timestamp columns** — see Scope Decisions below.
-
----
-
-## Scope Decisions
-
-This build is a scoped-down, runnable version of a larger team proposal. Every simplification is deliberate and justified — not a shortcut.
-
-### 1. Per-flow anomaly detection instead of per-entity behavioral profiling
-
-**Original plan:** Compute sliding-window behavioral features per source IP (connection rate, unique destinations contacted, etc.), producing one "entity profile" row per (source IP, time window). Isolation Forest then scores entity behaviour over time.
-
-**This build:** Each network flow row is scored independently by Isolation Forest. No windowing, no groupBy source IP.
-
-**Why:** The `cicds.csv` dataset is the Kaggle-cleaned combined CICIDS2017 export, which strips Source IP, Destination IP, and Timestamp — the three columns required for entity-level temporal profiling. Without those columns, per-host behavioral profiling is simply not possible. Per-flow scoring is a valid, industry-used IDS approach; many commercial SIEMs flag individual connection records rather than (or in addition to) entity behavioural baselines.
-
-### 2. Single KRaft-mode Kafka broker (no Zookeeper, no multi-broker cluster)
-
-KRaft mode eliminates Zookeeper entirely, saving ~300–500MB RAM. A single broker demonstrates all Kafka concepts (topics, partitions, consumer groups, producer acknowledgements) without the cluster overhead that a 3-broker setup requires.
-
-### 3. SQLite instead of MongoDB / Cassandra
-
-Both MongoDB and Cassandra require an additional running server process (~300–800MB RAM each). SQLite is a file-based database with zero server overhead. For a local demo with tens of thousands of alert rows, SQLite is more than sufficient and is accessed with the same SQL semantics as any production database.
-
-### 4. scikit-learn instead of Spark MLlib
-
-Spark MLlib has no native Isolation Forest implementation (a third-party JAR would be needed). More importantly: after Phase 3 preprocessing, the data passed to the ML step is already a moderately-sized NumPy matrix (at most 500K rows × 52 features), not a distributed dataset. Using Spark's distributed ML framework on data this small would add overhead with no benefit. The realistic industry pattern is exactly this: use Spark for distributed parsing and preprocessing of raw data at scale, then pull the compressed/aggregated output into a lightweight ML framework for modelling.
-
-### 5. Sampling to 500K rows for the Pandas/scikit-learn step
-
-The full ~2.8M row dataset is processed in Spark (phases 1–3). The Pandas/scikit-learn step samples up to 500K rows to stay within 8GB RAM. The sample is stratified-equivalent via Spark's `df.sample()` — attack type distribution is preserved. This is documented explicitly in `preprocess_flows.py` and is disabled if the machine has sufficient RAM.
-
----
-
-## Output artifacts
-
-| Path | Contents |
+| Target | What it does |
 |---|---|
-| `data/clean_parquet/` | Cleaned, typed Parquet (Phase 1 output) |
-| `data/preprocessed_parquet/` | Inf-cleaned Parquet (Phase 3 Spark output) |
-| `data/X_scaled.npy` | StandardScaler-normalized feature matrix |
-| `data/y_labels.npy` | Ground-truth label array (aligned with X_scaled) |
-| `models/scaler.joblib` | Fitted StandardScaler |
-| `models/isolation_forest.joblib` | Trained IsolationForest |
-| `models/random_forest.joblib` | Trained RandomForestClassifier |
-| `models/label_encoder.joblib` | LabelEncoder (string ↔ integer labels) |
-| `models/plots/` | Confusion matrices + score distribution plots |
-| `alerts.db` | SQLite database: flow_scores + alerts tables |
+| `setup` / `test` | create the host venv / run the pytest suite (local Spark, no Docker needed) |
+| `build`, `cluster-up`, `cluster-down`, `cluster-ps`, `logs` | cluster lifecycle |
+| `topics`, `topics-describe` | create topics from `conf/pipeline.yaml`, show partition layout |
+| `stream`, `stream-bg`, `stream-logs` | streaming app in the foreground / background / tail its log |
+| `stream-catchup` | drain everything available stage by stage, then exit (`availableNow`) |
+| `backfill`, `live` (`SPEEDUP=…`), `inject-bad` (`INJECT_BAD=…`) | Kafka replay producer |
+| `wait` | block until the stream has caught up |
+| `train` (`ARGS=--cv` for CrossValidator tuning), `evaluate`, `evaluate-live`, `maintenance` | Spark batch jobs on the lake |
+| `dashboard` | Streamlit dashboard |
+| `reset` | wipe the lake, checkpoints, registry and SQLite, and recreate the topics (asks first) |
 
+---
+
+## Repository layout
+
+```
+conf/pipeline.yaml        single source of truth: topics, partitions, paths, windows, thresholds, ML params
+docker/                   docker-compose.yml (full), docker-compose.lite.yml, spark/Dockerfile
+src/common/               config, SparkSession builder, dataset schema, dimension tables, Delta helpers
+src/ingestion/            create_topics.py, replay_producer.py, wait_caught_up.py
+src/streaming/            stream_app.py + bronze / silver / gold / scoring / metrics_listener
+src/ml/                   train_pipeline.py, evaluate.py, model_utils.py, registry.py
+src/lakehouse/            maintenance.py (Delta ops)
+src/serving/              SQLite schema + idempotent sink
+src/dashboard/app.py      Streamlit
+tests/                    synthetic CICIDS-shaped data + end-to-end pipeline tests
+data/                     (generated) raw/, lake/, checkpoints/, models/registry/, serving/, logs/
+```
+
+## Tests
+
+```bash
+make test     # 16 tests, ~3 min
+```
+The suite runs the real streaming queries in `availableNow` mode against a temporary lake. It
+covers bronze → silver (DQ quarantine, idempotent replay) → gold windows and port-scan detection →
+MLlib training → live scoring into Delta and SQLite → model hot reload →
+evaluation → Delta maintenance. Kafka sinks are switched off (`KAFKA_SINKS=0`). The Kafka source
+and the cluster itself are exercised by the steps in Quick start.
+
+## Troubleshooting
+
+- **The Mac swaps or containers get OOM-killed.** Stay on the default lite profile, keep live replays small (`LIVE_PCT`), and use `make stream-catchup` (one stage at a time) for big backlogs.
+- **`make train` says the streaming app is running.** That's deliberate: stop the stream (Ctrl+C), train or evaluate, then `make stream` again. With 6 GB of Docker memory, two Spark drivers at once got the driver container OOM-killed.
+- **`make wait` never finishes.** Check `make stream-logs`. The listener only records progress while the streaming app is running.
+- **Disk fills up.** Kafka retention is capped per partition in `pipeline.yaml`. `make maintenance` VACUUMs Delta. `make reset` wipes everything.

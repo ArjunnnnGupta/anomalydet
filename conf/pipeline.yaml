@@ -1,0 +1,90 @@
+# conf/pipeline.yaml — single source of truth for the whole pipeline.
+# Relative paths resolve against the project root (APP_HOME, /opt/app inside containers).
+
+dataset:
+  raw_dir: data/raw/cicids2017          # CICIDS2017 GeneratedLabelledFlows (TrafficLabelling) CSVs
+  encoding: latin1                      # files contain 0x96 in "Web Attack – Brute Force"
+  # Chronological replay order (day, then morning/afternoon)
+  files:
+    - Monday-WorkingHours.pcap_ISCX.csv
+    - Tuesday-WorkingHours.pcap_ISCX.csv
+    - Wednesday-workingHours.pcap_ISCX.csv
+    - Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv
+    - Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv
+    - Friday-WorkingHours-Morning.pcap_ISCX.csv
+    - Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv
+    - Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv
+  backfill_pct: 80                      # hash(row) % 100 < 80 → backfill, else live (held out)
+  benign_pct: 20                        # keep 20% of BENIGN rows and every attack row (~1.0M of 2.83M flows)
+
+kafka:
+  bootstrap_internal: kafka-1:19092,kafka-2:19092,kafka-3:19092   # inside the Docker network
+  bootstrap_external: localhost:9092,localhost:9094,localhost:9096  # from the host (producer, dashboard)
+  replication_factor: 3                 # overridden to 1 by KAFKA_RF=1 for the lite profile
+  min_insync_replicas: 2
+  topics:
+    raw:     {name: flows.raw,    partitions: 12, retention_bytes: 268435456}   # 256 MB per partition
+    scored:  {name: flows.scored, partitions: 6,  retention_bytes: 134217728}
+    alerts:  {name: alerts,       partitions: 3,  retention_bytes: 67108864}
+    dlq:     {name: flows.dlq,    partitions: 1,  retention_bytes: 33554432}
+  producer:
+    linger_ms: 20
+    batch_size: 262144
+    compression: lz4
+  lag_consumer_group: spark-bronze-ingest   # offsets committed by the metrics listener so lag shows in Kafka UI
+
+spark:
+  shuffle_partitions: 8
+  executor_memory: 800m                 # heap; + 256m direct memory + RocksDB 128m must fit the 1800m worker container
+  executor_direct_memory: 256m          # caps off-heap (Netty/Kafka buffers): 900m heap + uncapped off-heap got OOM-killed
+  executor_cores: 2                     # batch jobs (train / evaluate / maintenance): one 2-core executor per worker
+  stream_executor_cores: 1              # streaming app: 1-core executors ...
+  stream_cores_max: 2                   # ... x2 = one per worker. A single 2-core executor put all the work on
+                                        # worker-1 and got OOM-killed while worker-2 sat idle.
+                                        # Batch jobs run only while the stream is stopped (no room for 2 drivers in 6 GB).
+  driver_memory: 768m
+  event_log_dir: data/spark-events
+
+lake:
+  root: data/lake
+  bronze_flows: data/lake/bronze/flows
+  silver_flows: data/lake/silver/flows
+  silver_quarantine: data/lake/silver/quarantine
+  gold_attack_timeline: data/lake/gold/attack_timeline
+  gold_host_profile: data/lake/gold/host_profile
+  gold_port_scan: data/lake/gold/port_scan_candidates
+  gold_scored: data/lake/gold/scored_flows
+  gold_model_predictions: data/lake/gold/model_predictions
+  checkpoints: data/checkpoints
+
+streaming:
+  trigger_seconds: 5
+  max_offsets_per_trigger: 20000        # backpressure: cap records per micro-batch (sized for 8 GB laptop)
+  max_files_per_trigger: 24             # same idea for the Delta-stream stages (silver, gold, scoring) ...
+  max_bytes_per_trigger: 16m            # ... whichever limit is hit first
+  watermark: 10 minutes                 # tolerated event-time disorder (CICIDS rows are not strictly ordered)
+  timeline_window: 1 minute             # tumbling
+  host_window: 1 minute                 # per-host window length ...
+  host_slide: 1 minute                  # ... = slide → tumbling (a 5-min/1-min slide puts every flow in 5 windows: 5x the work)
+  port_scan_distinct_ports: 50          # host touching > N distinct dst ports in one window
+
+ml:
+  registry: data/models/registry
+  label_col: label_family
+  normal_label: Normal Traffic
+  train_fraction: 0.8
+  seed: 42
+  rf:
+    num_trees: [50]
+    max_depth: [10, 14]
+    max_bins: 64
+    cv_folds: 2
+    cv_parallelism: 2
+  kmeans:
+    k: 8
+    max_iter: 20
+    threshold_quantile: 0.995           # of benign distances → anomaly threshold
+  alert_prob_threshold: 0.6             # RF P(attack) needed for a supervised alert
+
+serving:
+  sqlite_path: data/serving/alerts.db

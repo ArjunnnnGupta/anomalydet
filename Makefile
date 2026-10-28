@@ -1,98 +1,156 @@
-# Makefile — convenience commands for the anomaly detection pipeline.
-# Usage: make <target>
-# Requires: Java 17 LTS (export JAVA_HOME before running Spark or Kafka targets)
-#   export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
+# Makefile — Kappa-architecture anomaly-detection pipeline.
+#
+# Spark jobs run INSIDE the cluster (docker compose exec spark-master spark-submit ...).
+# The producer, topic admin, dashboard and tests run on the HOST from ./venv.
+#
+#   make setup build cluster-up topics      # once
+#   make stream                             # terminal 1: always-on streaming app
+#   make backfill && make wait              # terminal 2: build the lake
+#   (Ctrl+C the stream)  make train         # batch jobs run with the stream stopped
+#   make stream  /  make live               # terminal 1 / 2: real-time scoring of a held-out sample
+#   make dashboard                          # terminal 3: http://localhost:8501
+#
+# Default is the LITE profile (1 Kafka broker, 1 Spark worker), sized for an 8 GB Mac.
+# LITE=0 (e.g. `make cluster-up LITE=0`) switches every target to the 3-broker / 2-worker cluster.
 
-VENV      := venv
-PYTHON    := $(VENV)/bin/python
-PIP       := $(VENV)/bin/pip
-JAVA_HOME ?= /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
-KAFKA_BIN := /opt/homebrew/opt/kafka/bin
-KAFKA_CFG := kafka-kraft.properties
-KAFKA_LOG := /tmp/kafka-kraft-logs
+VENV    := venv
+PY      := $(VENV)/bin/python
+LITE    ?= 1
 
-export JAVA_HOME
+ifeq ($(LITE),1)
+  COMPOSE := docker compose -f docker/docker-compose.lite.yml
+  export KAFKA_RF := 1
+  export KAFKA_BOOTSTRAP := localhost:9092
+else
+  COMPOSE := docker compose -f docker/docker-compose.yml
+endif
 
-.PHONY: all setup test test-spark kafka-format kafka-start kafka-topic kafka-stop \
-        clean-data producer consumer preprocess train-if train-rf evaluate \
-        write-alerts dashboard report clean
+# SKIP_BACKLOG=1: queries with no checkpoint start at their source table's current end (see src/common/lake.py)
+SKIP_ENV = $(if $(SKIP_BACKLOG),-e STREAM_SKIP_BACKLOG=1)
+SUBMIT = $(CAFF) $(COMPOSE) exec $(SKIP_ENV) $(1) spark-master spark-submit --master spark://spark-master:7077
+# Batch jobs refuse to start while the streaming app runs: in 6 GB there is no room for two Spark
+# drivers (running evaluate next to the stream got the driver container OOM-killed).
+NO_STREAM = @curl -s http://localhost:8081/json/ | python3 -c "import json,sys; \
+  apps=[a['name'] for a in json.load(sys.stdin)['activeapps']]; \
+  sys.exit('\n  The streaming app is running. Stop it first (Ctrl+C in its terminal), then rerun.\n  (6 GB has no room for two Spark drivers.)\n' if 'kappa-stream-app' in apps else 0)"
+SPEEDUP    ?= 300
+# Live demo replays a 15% sample of the held-out flows (~30K, a few minutes)
+LIVE_PCT   ?= 15
+# Keep the Mac awake while long pipeline commands run (a sleep killed the stream once)
+CAFF := $(shell command -v caffeinate >/dev/null 2>&1 && echo caffeinate -i)
+INJECT_BAD ?= 50
+ARGS       ?=
 
-## Full pipeline (no streaming)
-all: clean-data preprocess train-if train-rf evaluate write-alerts
+.PHONY: help setup test build cluster-up cluster-down cluster-ps logs topics topics-describe \
+        stream stream-bg stream-logs stream-catchup produce backfill live inject-bad wait train evaluate \
+        evaluate-live maintenance dashboard report reset
 
-## Phase 0 — environment
+help:
+	@grep -E '^## ' Makefile | sed 's/## //'
+
+## setup            create ./venv with host deps (producer, dashboard, tests)
 setup:
-	bash scripts/setup.sh
+	python3 -m venv $(VENV) && $(VENV)/bin/pip install -U pip && $(VENV)/bin/pip install -r requirements.txt
 
-test-spark:
-	$(PYTHON) test_spark.py
-
+## test             pytest suite (local Spark, no Docker/Kafka needed)
 test:
-	$(PYTHON) tests/test_pipeline.py
+	$(PY) -m pytest tests/ -q -p no:warnings
 
-## Kafka lifecycle (KRaft mode — no ZooKeeper, no Docker required)
-kafka-format:
-	rm -rf $(KAFKA_LOG)
-	JAVA_HOME=$(JAVA_HOME) $(KAFKA_BIN)/kafka-storage format \
-		-t $$($(KAFKA_BIN)/kafka-storage random-uuid) \
-		-c $(KAFKA_CFG)
+# ── Cluster ────────────────────────────────────────────────────────────────────
+## build            build the Spark image (Kafka + Delta jars baked in)
+build:
+	$(COMPOSE) build
 
-kafka-start:
-	JAVA_HOME=$(JAVA_HOME) $(KAFKA_BIN)/kafka-server-start $(KAFKA_CFG) \
-		> /tmp/kafka.log 2>&1 &
-	@echo "Kafka started. Logs at /tmp/kafka.log"
-	@sleep 4
+## cluster-up       start Kafka brokers, Kafka UI, Spark master + workers
+cluster-up:
+	$(COMPOSE) up -d
+	@echo "Kafka UI      http://localhost:8080"
+	@echo "Spark master  http://localhost:8081"
 
-kafka-topic:
-	JAVA_HOME=$(JAVA_HOME) $(KAFKA_BIN)/kafka-topics \
-		--create --topic network-flows --partitions 1 \
-		--replication-factor 1 --bootstrap-server localhost:9092
+cluster-down:
+	$(COMPOSE) down
 
-kafka-stop:
-	JAVA_HOME=$(JAVA_HOME) $(KAFKA_BIN)/kafka-server-stop || true
+cluster-ps:
+	$(COMPOSE) ps
 
-## Phase 1 — data cleaning
-clean-data:
-	$(PYTHON) src/processing/clean_data.py
+logs:
+	$(COMPOSE) logs -f --tail=100
 
-## Phase 2 — streaming
-producer:
-	$(PYTHON) src/ingestion/kafka_producer.py --sample 500
+## topics           create Kafka topics from conf/pipeline.yaml and show leaders/ISR
+topics:
+	$(PY) -m src.ingestion.create_topics $(ARGS)
 
-consumer:
-	$(PYTHON) src/ingestion/spark_consumer.py
+topics-describe:
+	$(PY) -m src.ingestion.create_topics --describe
 
-## Phase 3 — feature preprocessing
-preprocess:
-	$(PYTHON) src/processing/preprocess_flows.py
+# ── Streaming (Kappa) ─────────────────────────────────────────────────────────
+## stream           run the always-on streaming app (Q1–Q4) in the foreground
+stream:
+	$(call SUBMIT,) --driver-memory 768m /opt/app/src/streaming/stream_app.py $(ARGS)
 
-## Phase 4 — ML
-train-if:
-	$(PYTHON) src/ml/train_isolation_forest.py
+## stream-bg        same, detached; output in data/logs/stream_app.log (make stream-logs)
+stream-bg:
+	mkdir -p data/logs
+	$(COMPOSE) exec -d $(SKIP_ENV) spark-master sh -c "spark-submit --master spark://spark-master:7077 \
+	  --driver-memory 768m /opt/app/src/streaming/stream_app.py $(ARGS) > /opt/app/data/logs/stream_app.log 2>&1"
+	@echo "Streaming app started in the background → data/logs/stream_app.log"
 
-train-rf:
-	$(PYTHON) src/ml/train_random_forest.py
+stream-logs:
+	tail -f data/logs/stream_app.log
 
+## stream-catchup   drain everything available stage by stage, then exit
+stream-catchup:
+	$(call SUBMIT,) --driver-memory 768m /opt/app/src/streaming/stream_app.py --available-now
+
+## backfill         replay the ~80% backfill split at full speed (historical timestamps)
+backfill:
+	$(CAFF) $(PY) -m src.ingestion.replay_producer --split backfill $(ARGS)
+
+## live             replay a LIVE_PCT% sample of the held-out flows at SPEEDUP× event time (LIVE_PCT=100: all)
+live:
+	$(CAFF) $(PY) -m src.ingestion.replay_producer --split live --sample-pct $(LIVE_PCT) --speedup $(SPEEDUP) $(ARGS)
+
+## inject-bad       send INJECT_BAD malformed records (→ quarantine + flows.dlq)
+inject-bad:
+	$(PY) -m src.ingestion.replay_producer --inject-bad $(INJECT_BAD) --bad-only
+
+## wait             block until the stream has consumed every Kafka message and silver is idle
+wait:
+	$(CAFF) $(PY) -m src.ingestion.wait_caught_up
+
+# ── ML + lakehouse ops ────────────────────────────────────────────────────────
+## train            MLlib training on silver (backfill split) → registers vN (stream must be stopped)
+train:
+	$(NO_STREAM)
+	$(call SUBMIT,) --driver-memory 1g /opt/app/src/ml/train_pipeline.py $(ARGS)
+
+## evaluate         metrics + plots for the latest model on its held-out test split
 evaluate:
-	$(PYTHON) src/ml/evaluate.py
+	$(NO_STREAM)
+	$(call SUBMIT,) --driver-memory 1g /opt/app/src/ml/evaluate.py $(ARGS)
 
-## Phase 5 — storage
-write-alerts:
-	$(PYTHON) src/storage/write_alerts.py
+## evaluate-live    same, on the live stream's scored output
+evaluate-live:
+	$(NO_STREAM)
+	$(call SUBMIT,) --driver-memory 1g /opt/app/src/ml/evaluate.py --live $(ARGS)
 
-## Phase 6 — dashboard
+## maintenance      OPTIMIZE/ZORDER, DESCRIBE HISTORY, time travel, schema evolution, VACUUM
+maintenance:
+	$(NO_STREAM)
+	$(call SUBMIT,) --driver-memory 1g /opt/app/src/lakehouse/maintenance.py $(ARGS)
+
+## dashboard        Streamlit on http://localhost:8501
 dashboard:
-	$(VENV)/bin/streamlit run src/dashboard/app.py
+	PYTHONPATH=. $(VENV)/bin/streamlit run src/dashboard/app.py
 
-## Report
+## report           regenerate the (unchanged) Review-2 report PDF from REPORT.md
 report:
-	$(PYTHON) generate_report_pdf.py
+	$(PY) generate_report_pdf.py
 
-## Full cleanup (preserves raw CSV)
-clean:
-	rm -rf data/clean_parquet data/preprocessed_parquet data/streaming_parquet \
-	       data/checkpoint data/X_scaled.npy data/y_labels.npy \
-	       data/if_scores.npy data/if_flags.npy data/rf_predictions.npy data/rf_test_y.npy \
-	       data/feature_cols.json models/*.joblib alerts.db
-	@echo "Cleaned all generated artifacts."
 
+## reset            wipe the lake, checkpoints, registry and SQLite, and recreate the topics
+reset:
+	@read -p "Delete data/lake, data/checkpoints, data/models, data/serving and all Kafka data? [y/N] " a; \
+	  [ "$$a" = "y" ] || exit 1
+	rm -rf data/lake data/checkpoints data/models data/serving data/spark-events
+	$(PY) -m src.ingestion.create_topics --recreate

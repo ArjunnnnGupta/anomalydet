@@ -1,10 +1,16 @@
-pyspark==3.5.1
-pandas==2.2.2
-scikit-learn==1.5.1
-streamlit==1.37.1
-kafka-python==2.0.2
-pyarrow==17.0.0
-joblib==1.4.2
-matplotlib==3.9.2
-plotly==5.23.0
-
+# Host-side dependencies: replay producer, topic admin, dashboard, and the pytest suite.
+# Spark jobs run inside the cluster image (docker/spark/Dockerfile), which has its own pins.
+pyspark==3.5.3
+delta-spark==3.2.1
+pandas==2.2.3          # PySpark 3.5 is not compatible with pandas 3
+numpy>=2.1,<2.3
+pyarrow==18.1.0
+confluent-kafka>=2.5
+deltalake>=1.0         # delta-rs: dashboard reads Delta tables without Spark
+streamlit>=1.50
+plotly>=5.23
+matplotlib>=3.9
+pyyaml>=6.0
+setuptools             # distutils shim PySpark 3.5 needs on Python 3.12+
+pytest>=8
+reportlab              # only for `make report` (generate_report_pdf.py)

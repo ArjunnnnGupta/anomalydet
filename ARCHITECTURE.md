@@ -1,597 +1,357 @@
-# Architecture & Component Reference
-## Flow-Level Network Anomaly Detection Platform
+# Architecture
+## Kappa Network-Flow Anomaly Detection Platform
 
-> **Audience:** Teammates who need to understand, run, and extend each component of the pipeline.
-> **Style:** Technical/engineering — uses domain-specific terminology throughout.
-
----
-
-## Table of Contents
-
-1. [System Overview](#1-system-overview)
-2. [Phase 0 — Environment & Setup](#2-phase-0--environment--setup)
-3. [Phase 1 — Distributed Data Ingestion & Cleaning](#3-phase-1--distributed-data-ingestion--cleaning)
-4. [Phase 2 — Kafka Streaming Ingestion](#4-phase-2--kafka-streaming-ingestion)
-5. [Phase 3 — Feature Preprocessing](#5-phase-3--feature-preprocessing)
-6. [Phase 4a — Isolation Forest (Unsupervised Anomaly Detection)](#6-phase-4a--isolation-forest-unsupervised-anomaly-detection)
-7. [Phase 4b — Random Forest (Supervised Multi-Class Classification)](#7-phase-4b--random-forest-supervised-multi-class-classification)
-8. [Phase 4c — Evaluation](#8-phase-4c--evaluation)
-9. [Phase 5 — SQLite Alert Storage](#9-phase-5--sqlite-alert-storage)
-10. [Phase 6 — Streamlit Dashboard](#10-phase-6--streamlit-dashboard)
-11. [Test Suite](#11-test-suite)
-12. [Data Flow Summary Table](#12-data-flow-summary-table)
+> **Audience:** teammates and evaluators who need to understand how the pipeline works,
+> why it's built this way, and where each big data concept lives in the code.
 
 ---
 
-## 1. System Overview
-
-The platform ingests ~2.52 million labelled **CICIDS2017 network flow records**, cleans and transforms them using **Apache Spark**, runs both unsupervised and supervised ML models for anomaly detection, stores actionable alerts in **SQLite**, and serves them via a **real-time Streamlit dashboard**. An independent **Kafka streaming path** simulates a live sensor feed running in parallel to the batch pipeline.
-
-### Master Pipeline Flowchart
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Raw Dataset                                  │
-│              cicds.csv  (2,520,751 rows × 53 cols, ~680 MB)         │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │
-                    ┌────────▼────────┐
-                    │   Phase 1       │   Apache Spark (local[*])
-                    │   Data Cleaning │   schema enforcement,
-                    │                 │   null/inf removal,
-                    └────────┬────────┘   label normalisation
-                             │
-                    Parquet (data/clean_parquet/)
-                    2,520,751 rows, 53 cols
-                             │
-               ┌─────────────┴──────────────┐
-               │                            │
-      ┌────────▼────────┐          ┌────────▼────────┐
-      │   Phase 2       │          │   Phase 3       │
-      │   Kafka         │          │   Feature       │
-      │   Streaming     │          │   Preprocessing │
-      │   (parallel)    │          │                 │
-      └────────┬────────┘          └────────┬────────┘
-               │                            │
-        JSON messages                 X_scaled.npy  (500,407 × 52)
-        → network-flows topic         y_labels.npy
-        → Parquet sink                scaler.joblib
-                             (merged below for ML)
-                                            │
-                             ┌──────────────┤
-                             │              │
-                    ┌────────▼──┐    ┌──────▼──────┐
-                    │  Phase 4a │    │  Phase 4b   │
-                    │ Isolation │    │   Random    │
-                    │  Forest   │    │   Forest    │
-                    └────────┬──┘    └──────┬──────┘
-                             │              │
-                       if_flags.npy   rf_predictions.npy
-                       if_scores.npy  (99.70% accuracy)
-                             │              │
-                             └──────┬───────┘
-                                    │
-                           ┌────────▼────────┐
-                           │   Phase 4c      │
-                           │   Evaluation    │
-                           │   & Plots       │
-                           └────────┬────────┘
-                                    │
-                           ┌────────▼────────┐
-                           │   Phase 5       │
-                           │   SQLite        │
-                           │   alerts.db     │
-                           └────────┬────────┘
-                                    │
-                           ┌────────▼────────┐
-                           │   Phase 6       │
-                           │   Streamlit     │
-                           │   Dashboard     │
-                           │   :8501         │
-                           └─────────────────┘
-```
+## Contents
+1. [Why Kappa (and not Lambda)](#1-why-kappa-and-not-lambda)
+2. [Cluster topology](#2-cluster-topology)
+3. [Kafka design](#3-kafka-design)
+4. [The streaming application](#4-the-streaming-application)
+5. [Delta Lake medallion tables](#5-delta-lake-medallion-tables)
+6. [Machine learning with MLlib](#6-machine-learning-with-mllib)
+7. [Serving and observability](#7-serving-and-observability)
+8. [Fault tolerance and delivery guarantees](#8-fault-tolerance-and-delivery-guarantees)
+9. [Big data concepts → where in the code](#9-big-data-concepts--where-in-the-code)
+10. [Limitations and honest caveats](#10-limitations-and-honest-caveats)
 
 ---
 
-## 2. Phase 0 — Environment & Setup
+## 1. Why Kappa (and not Lambda)
 
-### What it does
-Bootstraps the Python virtual environment and verifies that **Java 17 LTS** is correctly resolved before any Spark or Kafka component is invoked. Java 17 is a hard requirement — PySpark 3.5.1 uses `Subject.getSubject` internally, which was removed from the JDK in Java 21+. Using any newer JDK causes an `UnsupportedOperationException` at Spark initialisation.
+A **Lambda** architecture keeps two code paths: a batch layer that recomputes everything from
+the raw files, and a speed layer that handles fresh events. Logic gets duplicated, and the two
+paths drift apart. That was this project's earlier shape: Spark batch on a CSV, with Kafka as a side demo.
 
-### Key design decisions
-- **Isolated venv** (`venv/`): prevents dependency conflicts with system Python.
-- **`openjdk@17` (keg-only Homebrew)**: not linked into system PATH, so every Spark and Kafka script explicitly sets `JAVA_HOME` to the full Cellar path. This is more robust than relying on `which java`, which returns `/usr/bin/java` — a macOS stub that errors when no JDK is installed.
-- **`kafka-python-ng`** is used instead of the original `kafka-python` — the latter has no Python 3.13 wheels.
-- **`setuptools`** is installed explicitly to restore the `distutils` shim removed in Python 3.13 (required by PySpark's `toPandas()` path).
+A **Kappa** architecture keeps one path. **The log is the source of truth.** Every record
+enters through Kafka, and every derived table is built by stream processing. Reprocessing means
+replaying the log (or the Delta tables, which are themselves replayable logs) through the same code.
 
-### How to run
-```bash
-make setup          # installs venv + all packages
-make test-spark     # verifies PySpark starts cleanly with openjdk@17
 ```
+            ┌────────────────────────── ONE code path ──────────────────────────┐
+ CSVs ─► producer ─► Kafka ─► bronze ─► silver ─► gold / scoring ─► sinks
+            └── replay = re-read the log (Kafka offsets or Delta versions) ─────┘
+```
+
+**Bootstrapping a model in a Kappa system: two passes through Kafka**
+
+| Pass | What is replayed | What happens |
+|---|---|---|
+| 1. backfill | ~80% of flows (deterministic hash), full speed, original 2017 timestamps | The stream builds bronze, silver and gold. Scoring idles ("no model yet"). |
+| train | — | MLlib reads silver (backfill split) and registers model **v1** |
+| 2. live | the held-out ~20%, paced at N× real time, timestamps re-based to now | The stream hot-loads v1 and scores every flow in real time |
+
+CICIDS2017 puts each attack type on a different day, so a time-based split would hide whole
+attack families from training. The hash split keeps every family in both passes, and live
+scoring doubles as a genuine held-out evaluation (`make evaluate-live`).
+
+**Demo-sized data.** The full dataset is 2.83M flows, about 80% benign. To keep the demo fast on
+a laptop, the producer keeps **every attack flow and 20% of the benign flows** (deterministic
+hash, `dataset.benign_pct`), which is **1,012,310 flows**: about 810K backfill and 203K live.
+This makes attacks about 55% of the replayed traffic instead of 20%, so the models train on a more
+balanced set and precision looks better than it would on real-world traffic. Set `benign_pct: 100`
+to replay everything.
 
 ---
 
-## 3. Phase 1 — Distributed Data Ingestion & Cleaning
+## 2. Cluster topology
 
-### Flowchart
+> **Default on the laptop: the lite profile** (`docker-compose.lite.yml`): 1 Kafka broker (RF=1),
+> Kafka UI, the Spark master and **1 worker** (2 cores, 3 GB). On an 8 GB Mac with Docker at 6 GB the
+> full cluster below kept running out of memory, so the demo runs lite. Everything else (topics,
+> partitions, the streaming app, Delta, MLlib) is identical. The full cluster is one flag away
+> (`LITE=0`) and is described here because it shows replication.
 
 ```
-cicds.csv (raw, ~680 MB)
-        │
-        ▼
-[Spark CSV reader]
-  ├─ inferSchema=true  (Spark auto-detects column dtypes)
-  └─ spark.sql.shuffle.partitions=8  (local mode optimisation; default 200 is wasteful)
-        │
-        ▼
-[Schema Enforcement]
-  ├─ All columns cast to DoubleType except "Attack Type" (StringType)
-  ├─ Column names stripped of leading/trailing whitespace
-  └─ "Attack Type" values normalised (strip whitespace)
-        │
-        ▼
-[Null / Infinity Drop]
-  ├─ Rows with any null replaced: numeric cols → 0.0
-  └─ Rows with ±Infinity in any numeric column → dropped
-        │
-        ▼
-Parquet write (snappy compression, 8 partitions)
-→  data/clean_parquet/
-   2,520,751 rows × 53 columns
-   0 dropped rows (dataset was pre-cleaned by Kaggle source)
+┌──────────────────────────── Docker network ────────────────────────────┐
+│                                                                         │
+│  kafka-1 ◄──Raft──► kafka-2 ◄──Raft──► kafka-3    (combined broker +    │
+│  :9092                :9094               :9096    controller, KRaft)   │
+│     ▲ replication: every partition has 3 replicas, min.insync = 2       │
+│     │                                                                   │
+│  kafka-ui :8080                                                         │
+│                                                                         │
+│  spark-master :8081 ──┬── spark-worker-1 (2 cores, 1200m)               │
+│  (+ drivers, client   └── spark-worker-2 (2 cores, 1200m)               │
+│   mode :4040/:4041)                                                     │
+│        all mount the project at /opt/app  (shared FS for Delta tables)  │
+└─────────────────────────────────────────────────────────────────────────┘
+  host: replay producer · topic admin · Streamlit dashboard · pytest
 ```
 
-### What it does
-The raw CSV is read into a **Spark DataFrame** using the CSV reader with schema inference. Every numeric column is explicitly re-cast to `DoubleType` to guarantee downstream numpy compatibility when the data is later converted. The only non-numeric column retained is `Attack Type`, which carries the ground-truth label for evaluation.
+| Service | Memory cap | Notes |
+|---|---|---|
+| 3 × Kafka | 512 MB (heap 320 MB) | internal listener `:19092`, host listeners 9092/9094/9096 |
+| Kafka UI | 320 MB | kafbat/kafka-ui |
+| Spark master | 2.5 GB | also hosts the drivers (stream app 768 MB, jobs 1 GB) |
+| 2 × Spark worker | 1.8 GB | executors: 800 MB heap + 256 MB direct memory (RocksDB state capped at 128 MB) |
 
-Null and infinity handling is applied defensively: nulls are filled with `0.0` (network counters that are absent default to zero), and rows with infinite values (e.g., division-by-zero in flow-duration-derived features) are dropped. The output is written as **Parquet** — a columnar format with snappy compression that reduces read time for subsequent phases from ~20s (CSV) to ~2s.
+The streaming app runs as **two 1-core executors, one per worker** (`spark.cores.max=2`,
+`executor.cores=1`), under FAIR scheduling. An earlier layout with one 2-core executor put all the
+work on worker-1, which was OOM-killed while worker-2 sat idle.
 
-### Key I/O
-| | Detail |
-|---|---|
-| **Input** | `data/raw/cicds.csv` (symlink → `../cicds.csv`) |
-| **Output** | `data/clean_parquet/` (8 part-files, snappy) |
-| **Row count** | 2,520,751 |
-| **Columns** | 53 (52 numeric features + `Attack Type`) |
-
-### How to run
-```bash
-make clean-data
-```
+**Batch jobs (train, evaluate, maintenance) run only while the stream is stopped.** The drivers
+live in the master container, and two at once (stream + evaluate) got it OOM-killed on 6 GB.
+The Makefile refuses to start a batch job while the stream runs. On a larger cluster the two
+can run side by side, and the scorer then swaps a newly trained model in mid-stream: it
+re-reads the registry's `latest.json` on every micro-batch (covered by the test suite).
+`docker-compose.lite.yml` (1 broker, 1 worker) is the fallback for machines that swap.
 
 ---
 
-## 4. Phase 2 — Kafka Streaming Ingestion
+## 3. Kafka design
 
-### Flowchart
+| Topic | Partitions | Key | Producer → consumer |
+|---|---|---|---|
+| `flows.raw` | 12 | Source IP | replay producer → Q1 bronze |
+| `flows.scored` | 6 | Source IP | Q4 → any downstream consumer (SIEM, archiver) |
+| `alerts` | 3 | flow_uid | Q4 → alerting / ticketing |
+| `flows.dlq` | 1 | DQ reason | Q2 → dead-letter inspection |
 
-```
-data/clean_parquet/
-        │
-        ▼
-[Kafka Producer]
-  ├─ Loads Parquet with pandas (no Spark needed for producer)
-  ├─ Optional --sample N flag (default: full dataset)
-  ├─ Serialises each row to JSON (keys = column names)
-  ├─ Sends in batches of 50 rows
-  └─ Sleeps 0.5s between batches (simulates live sensor rate ~100 rows/s)
-        │
-        ▼ JSON messages
-[Kafka Broker — KRaft mode]
-  Topic: network-flows
-  Partitions: 1
-  Broker: localhost:9092
-  No ZooKeeper — uses KRaft (Kafka 4.x built-in Raft consensus)
-        │
-        ▼
-[Spark Structured Streaming Consumer]
-  ├─ Reads from Kafka using readStream()
-  ├─ Parses JSON payload → DataFrame with inferred schema
-  ├─ Writes micro-batches to Parquet sink (data/streaming_parquet/)
-  └─ Checkpoint dir: data/checkpoint/ (enables exactly-once semantics)
-        │
-        ▼
-data/streaming_parquet/
-  (partitioned Parquet, written per micro-batch)
-```
+- **Partitioning and keys:** keying by Source IP sends every flow of a host to one partition.
+  That keeps each host's events in order and spreads load across 12 partitions, which caps
+  consumer parallelism at 12.
+- **Replication (full cluster, `LITE=0`):** RF=3, `min.insync.replicas=2`, and producer `acks=all`. A write
+  is acknowledged once 2 of the 3 replicas have it, so one broker can fail with no data loss and no
+  downtime. The default lite profile has one broker (RF=1): partitioning still applies, replication doesn't.
+- **Idempotent producer:** `enable.idempotence=true`, so librdkafka retries never create duplicates.
+- **Throughput tuning:** `linger.ms=20`, `batch.size=256KB`, `compression.type=lz4`.
+  When the local queue is full, the producer calls `poll()` until it drains, which gives natural backpressure.
+- **Retention:** `retention.bytes` per partition protects the laptop's disk. Kafka is the
+  replay buffer, and Delta bronze is the durable copy.
+- **Replay:** the producer can send the dataset again at any speed. The streaming queries can
+  also be reset to `startingOffsets=earliest` by deleting a checkpoint.
 
-### What it does
-The streaming path decouples **data production** from **data consumption**, which mirrors a real-world network monitoring architecture (e.g., a packet capture agent → Kafka → a processing cluster).
-
-The **producer** reads rows from the already-cleaned Parquet store and serialises each flow record to a JSON string. It publishes to the `network-flows` Kafka topic in batches, sleeping between batches to control throughput. This makes the producer replay-safe — running it again simply appends to the topic (Kafka offsets are monotonically increasing).
-
-The **consumer** uses Spark Structured Streaming's native Kafka connector. It reads from offset `earliest`, parses each JSON message into a typed DataFrame, and writes micro-batches to a Parquet sink using `outputMode("append")`. A checkpoint directory tracks which offsets have already been committed, ensuring **exactly-once processing** on restart.
-
-**Kafka is deployed in KRaft mode** (Kafka 4.x). This eliminates the ZooKeeper dependency, reducing operational complexity from a two-process cluster to a single broker JVM process.
-
-### Key I/O
-| | Detail |
-|---|---|
-| **Input** | `data/clean_parquet/` (pandas read, optional sample) |
-| **Kafka topic** | `network-flows`, 1 partition, localhost:9092 |
-| **Output (consumer)** | `data/streaming_parquet/` + `data/checkpoint/` |
-| **Throughput demo** | 500 rows published in 5.4s, ~101 rows/s confirmed |
-
-### How to run
-```bash
-# Terminal 1 — start broker (already done; skip if broker is running)
-make kafka-format && make kafka-start
-
-# Terminal 2 — create topic (only needed once)
-make kafka-topic
-
-# Terminal 3 — start consumer first, then producer
-make consumer     # starts Spark Structured Streaming listener
-make producer     # streams 500 rows (--sample 500 by default)
-```
+**Event-time replay** (`replay_producer.py`): rows are sorted by flow start time within each
+file. A virtual clock advances by the event-time gap between rows (capped at 60s, so nights and
+weekends don't stall the demo), and the producer sleeps whenever it gets ahead of
+`virtual_time / speedup`. In the live pass, each record also carries `replay_ts_ms` (wall-clock
+send time), which becomes its `event_time` in silver. The Kafka record timestamp is deliberately
+**not** set to the event time: broker retention works on record timestamps, so stamping 2017
+timestamps made Kafka delete the whole backfill within minutes (found in the first real cluster
+run). The event time lives in the payload, and Kafka's own timestamp is the send time. The bronze
+source also runs with `failOnDataLoss=true`, so skipped offsets fail the query instead of
+silently losing data.
 
 ---
 
-## 5. Phase 3 — Feature Preprocessing
+## 4. The streaming application
 
-### Flowchart
+`src/streaming/stream_app.py` runs **five streaming queries in one Spark application**.
+Each query has its own checkpoint and FAIR-scheduler pool.
 
 ```
-data/clean_parquet/ (2,520,751 rows)
-        │
-        ▼
-[Pandas read_parquet]
-  └─ Loads full cleaned dataset
-        │
-        ▼
-[Stratified Sampling]
-  ├─ Target: fit within 8 GB RAM budget on M2 MacBook Air
-  ├─ Fraction: 0.198 (empirically tuned)
-  └─ Result: 500,407 rows
-        │
-        ├──────────────────────────────┐
-        ▼                              ▼
-[Feature Matrix X]              [Label Vector y]
-  52 numeric columns              "Attack Type" column
-  (all columns except             (object/string, preserved
-   "Attack Type")                  as-is for stratification)
-        │
-        ▼
-[StandardScaler fit_transform]
-  ├─ Computes μ and σ per feature across 500,407 rows
-  ├─ Transforms each feature to zero mean, unit variance
-  └─ Ensures heterogeneous features (e.g., flow duration
-     in microseconds vs. binary TCP flags) are on the
-     same scale before distance-based and tree-based models
-        │
-        ▼
-data/X_scaled.npy    (500,407 × 52, float64)
-data/y_labels.npy    (500,407,  object — attack type strings)
-data/feature_cols.json  (ordered list of 52 column names)
-models/scaler.joblib    (fitted StandardScaler, for inference)
+Kafka flows.raw
+   │ Q1 q1_bronze           readStream.format("kafka"), maxOffsetsPerTrigger=20k
+   ▼
+Delta bronze_flows          raw JSON + topic/partition/offset/kafka_ts (append-only)
+   │ Q2 q2_silver           Delta-as-stream source
+   │   from_json(explicit schema) → event-time parsing → casts (Inf/NaN→NULL)
+   │   → label cleaning + 8 families → sha2 flow_uid → 4 DQ rules
+   │   → stream-static BROADCAST joins (dim_subnets ×2, dim_ports)
+   │   → foreachBatch: bad → quarantine (Delta) + flows.dlq (Kafka)
+   │                   good → dropDuplicates → idempotent append into silver (txnVersion)
+   ▼
+Delta silver_flows ─────────┬───────────────────────────────┐
+   │ Q3a q3a_gold_timeline  │ Q3b q3b_gold_hosts             │ Q4 q4_scoring (split = live)
+   │ watermark 10 min       │ watermark 10 min               │ foreachBatch:
+   │ 1-min TUMBLING window  │ 1-min TUMBLING window          │   HotLoader → newest model
+   │ × split × family       │ × split × src_ip               │   features → RF → KMeans
+   │ count, bytes,          │ approx_count_distinct(dst_ip,  │   P(attack), centroid distance
+   │ approx distinct srcs   │ dst_port), SYN/RST ratios      │   is_alert / alert_reason
+   │ update mode → MERGE    │ → MERGE + port-scan filter     │   → gold_scored (txn-idempotent)
+   ▼                        ▼                                │   → Kafka flows.scored, alerts
+gold_attack_timeline   gold_host_profile, gold_port_scan     │   → SQLite alerts
+   (Delta only)            + SQLite                          ▼
+                                                    Delta gold_scored
 ```
 
-### What it does
-PySpark is deliberately **not used** in this phase — the full 2.52M-row dataset would require ~4 GB of RAM for a pandas DataFrame, and after stratified sampling to 500,407 rows the entire X matrix (~200 MB as float64) fits comfortably within the 8 GB unified memory budget. Using Spark here would add JVM startup overhead with no parallelism benefit.
-
-**Stratified sampling** is key: the label distribution in the sample preserves the same class proportions as the full dataset (e.g., ~83% Normal, ~8% DoS). This matters for training a meaningful class-weighted Random Forest in Phase 4b.
-
-**StandardScaler** is fitted on the training sample and persisted to `scaler.joblib`. Any new data arriving via Kafka must be transformed with the **same scaler instance** before being scored — applying a fresh fit to new data would shift the score distribution and invalidate comparisons.
-
-### Key I/O
-| | Detail |
-|---|---|
-| **Input** | `data/clean_parquet/` |
-| **Output** | `data/X_scaled.npy`, `data/y_labels.npy`, `models/scaler.joblib`, `data/feature_cols.json` |
-| **Sample size** | 500,407 rows (fraction ≈ 0.198 of 2.52M) |
-| **Feature count** | 52 (all numeric columns) |
-
-### How to run
-```bash
-make preprocess
-```
+**Design notes**
+- **Delta tables chain the queries together.** Each downstream query streams from the upstream
+  Delta table's transaction log. Stages can be restarted, replayed or scaled on their own, and
+  every intermediate state is a queryable table.
+- **Silver is an idempotent append, not a MERGE.** A retried batch carries the same
+  `txnVersion` and is skipped, so it's still exactly-once, and the log stays append-only, so
+  silver can itself be read as a stream. It started as an insert-only MERGE on `flow_uid`, but
+  that re-scanned the whole table every batch (~2.5 min per batch at 800K rows), too slow for a
+  live demo. MERGE is still used for the gold window tables, where the targets are small.
+- **Watermarks** bound the state for windowed aggregations. CICIDS rows aren't strictly
+  time-ordered, so 10 minutes of disorder is tolerated, and later rows are dropped from windows
+  (but they're still kept in silver).
+- **Update output mode** gives the dashboard low-latency window values. Each foreachBatch
+  MERGEs the changed windows into Delta (and, for host windows, upserts them into SQLite).
+- **Stateful aggregation:** the open windows of Q3a/Q3b are streaming state, kept in the RocksDB
+  state store and checkpointed, and dropped once the watermark passes the window end.
+- **Host windows are tumbling (1 min), not sliding.** The window length and slide are config
+  values; a 5-minute window sliding every minute puts each flow in 5 windows, which was too much
+  work for an 8 GB laptop. Setting `host_slide` smaller than `host_window` turns sliding back on.
+- **Catch-up mode:** `--available-now` runs each stage with `Trigger.AvailableNow` in upstream →
+  downstream order, then exits. The tests use it, and it's handy for reprocessing.
 
 ---
 
-## 6. Phase 4a — Isolation Forest (Unsupervised Anomaly Detection)
+## 5. Delta Lake medallion tables
 
-### Flowchart
-
-```
-data/X_scaled.npy  (500,407 × 52)
-        │
-        ▼
-[IsolationForest — scikit-learn]
-  ├─ n_estimators=100   (100 isolation trees in the ensemble)
-  ├─ contamination=0.17 (expects ~17% anomalous flows; tuned
-  │                      to match dataset's 17% attack rate)
-  ├─ n_jobs=-1           (uses all CPU cores in parallel)
-  └─ random_state=42
-        │
-        ├────────────────────────────┐
-        ▼                            ▼
-[score_samples()]            [predict()]
-  Returns anomaly score        Returns flag:
-  (more negative = more          -1 = anomaly
-   anomalous)                    +1 = normal
-        │                            │
-        ▼                            ▼
-data/if_scores.npy          data/if_flags.npy
-(500,407 floats)             (500,407 ints: -1 or +1)
-models/isolation_forest.joblib
-```
-
-### What it does
-Isolation Forest is an **unsupervised** ensemble method. It builds 100 randomised binary decision trees by repeatedly splitting a random subset of samples on a randomly chosen feature at a random threshold. Points that are isolated (reach a leaf node) in fewer splits are anomalous — they occupy sparse, outlier regions of the feature space and are easier to isolate than dense, normal-traffic clusters.
-
-The `contamination` hyperparameter tells the model what fraction of the training data to treat as anomalous when setting the decision threshold. It is set to **0.17** to match the dataset's known 17% attack rate (DoS + DDoS + PortScan + BruteForce + WebAttacks + Bots combined).
-
-The model operates **without any ground-truth labels** — it sees only the 52 scaled feature values. This makes it suitable for detecting **zero-day or novel attack patterns** that a supervised classifier would not recognise.
-
-The anomaly score (`score_samples()`) is a continuous signal between roughly -0.5 (highly anomalous) and 0 (normal). This score is persisted to `if_scores.npy` and stored in `alerts.db` to enable threshold tuning in the dashboard without rerunning the model.
-
-### Key I/O
-| | Detail |
-|---|---|
-| **Input** | `data/X_scaled.npy` |
-| **Output** | `data/if_scores.npy`, `data/if_flags.npy`, `models/isolation_forest.joblib` |
-| **Anomalies flagged** | 85,070 (17.00% of 500,407) |
-| **Binary accuracy vs. ground truth** | 83% |
-| **Attack recall** | 50% (expected for unsupervised — no label knowledge) |
-
-### How to run
-```bash
-make train-if
-```
-
----
-
-## 7. Phase 4b — Random Forest (Supervised Multi-Class Classification)
-
-### Flowchart
-
-```
-data/X_scaled.npy  (500,407 × 52)
-data/y_labels.npy  (500,407 attack-type strings)
-        │
-        ▼
-[LabelEncoder]
-  Maps string labels → integers:
-  Bots=0, Brute Force=1, DDoS=2, DoS=3,
-  Normal Traffic=4, Port Scanning=5, Web Attacks=6
-        │
-        ▼
-[Stratified 80/20 train/test split]
-  Train : 400,325 rows (stratified by class)
-  Test  : 100,082 rows (stratified by class)
-        │
-        ▼
-[RandomForestClassifier — scikit-learn]
-  ├─ n_estimators=100     (100 decision trees)
-  ├─ max_depth=20         (caps tree depth; prevents overfitting)
-  ├─ class_weight="balanced" (up-weights minority classes like Bots,
-  │                            Web Attacks during impurity calculation)
-  ├─ n_jobs=-1            (parallelised tree building)
-  └─ random_state=42
-        │
-        ▼
-[Predict on test set (100,082 rows)]
-  └─ Per-class F1 ≥ 0.96 for DoS, DDoS, Port Scanning, Normal
-     Bots F1 = 0.43 (only 1,558 train samples; class imbalance)
-        │
-        ▼
-data/rf_predictions.npy    (100,082 predicted integer labels)
-data/rf_test_y.npy         (100,082 true integer labels)
-models/random_forest.joblib
-models/label_encoder.joblib
-```
-
-### What it does
-Random Forest is a **supervised ensemble classifier**. It builds 100 independent decision trees on bootstrap samples of the training data, each split using a random subset of features (≈√52 ≈ 7 features per split). Final class predictions are determined by majority vote across all trees.
-
-`max_depth=20` prevents individual trees from memorising training samples while still allowing deep enough splits to separate subtle attack signatures (e.g., distinguishing Brute Force from Web Attacks by connection duration and packet ratio patterns).
-
-`class_weight="balanced"` automatically adjusts the impurity criterion so minority classes (Bots: 1,558 train samples vs. Normal Traffic: 1,676,045) contribute proportionally to splits. Without this, trees would simply predict "Normal Traffic" for almost everything and still achieve >83% accuracy.
-
-The stratified train/test split guarantees that both partitions contain the same class proportions, preventing the test set from being inadvertently easier or harder than the training distribution.
-
-**Test accuracy: 99.70%** across 100,082 held-out flows.
-
-### Key I/O
-| | Detail |
-|---|---|
-| **Input** | `data/X_scaled.npy`, `data/y_labels.npy` |
-| **Output** | `data/rf_predictions.npy`, `data/rf_test_y.npy`, `models/random_forest.joblib`, `models/label_encoder.joblib` |
-| **Classes** | 7: Normal Traffic, DoS, DDoS, Port Scanning, Brute Force, Web Attacks, Bots |
-| **Test accuracy** | 99.70% |
-| **Bots F1** | 0.43 (class imbalance; only 1,558 training samples) |
-
-### How to run
-```bash
-make train-rf
-```
-
----
-
-## 8. Phase 4c — Evaluation
-
-### Flowchart
-
-```
-data/if_flags.npy        data/rf_predictions.npy
-data/y_labels.npy        data/rf_test_y.npy
-        │                        │
-        ▼                        ▼
-[Binary evaluation          [Multi-class evaluation
- for IF]                     for RF]
-  ├─ True label binarised:    ├─ classification_report()
-  │   "Normal Traffic" → 0   │   (per-class precision,
-  │   all others      → 1   │    recall, F1)
-  ├─ IF flag: -1 → anomaly   └─ Confusion matrix heatmap
-  └─ Confusion matrix             → models/plots/rf_confusion_matrix.png
-       + score histogram
-       → models/plots/if_confusion_matrix.png
-       → models/plots/if_score_distribution.png
-```
-
-### What it does
-Two separate evaluation passes run sequentially:
-
-**Isolation Forest evaluation** converts the multi-class ground-truth labels into a binary "anomalous vs. normal" signal by treating any non-`Normal Traffic` label as positive. IF flags (`-1`/`+1`) are compared against this binary ground truth. The score histogram (`if_score_distribution.png`) shows the distribution of anomaly scores for normal vs. anomalous flows, confirming whether the contamination threshold separates the two populations.
-
-**Random Forest evaluation** uses the held-out 20% test split (`rf_test_y.npy`) directly — no binarisation needed. `classification_report()` reports per-class precision, recall, and F1. The confusion matrix shows where the model confuses attack categories (e.g., Bots often misclassified as DoS due to overlapping flow duration/packet count distributions).
-
-### Key outputs
-| File | Description |
-|---|---|
-| `models/plots/if_confusion_matrix.png` | Heatmap: IF binary TP/FP/TN/FN |
-| `models/plots/if_score_distribution.png` | Histogram: anomaly score by ground-truth class |
-| `models/plots/rf_confusion_matrix.png` | 7×7 normalised confusion matrix for RF |
-
-### How to run
-```bash
-make evaluate
-```
-
----
-
-## 9. Phase 5 — SQLite Alert Storage
-
-### Flowchart
-
-```
-data/X_scaled.npy      data/if_scores.npy
-data/y_labels.npy      data/if_flags.npy
-data/rf_predictions.npy
-        │
-        ▼
-[write_alerts.py]
-  ├─ Joins all arrays column-wise (by positional index)
-  ├─ Decodes RF integer predictions → label strings via LabelEncoder
-  └─ Writes two SQLite tables:
-
-        ┌──────────────────────────────────────┐
-        │  flow_scores  (500,407 rows)          │
-        │  ─────────────────────────────────── │
-        │  id, flow_index, anomaly_score,       │
-        │  if_flag, rf_label, ground_truth,     │
-        │  scored_at                            │
-        └──────────────────────────────────────┘
-
-        ┌──────────────────────────────────────┐
-        │  alerts  (85,070 rows)               │
-        │  ─────────────────────────────────── │
-        │  id, flow_index, anomaly_score,       │
-        │  rf_label, ground_truth, scored_at   │
-        │  (subset: only rows where if_flag=-1) │
-        └──────────────────────────────────────┘
-```
-
-### What it does
-SQLite was chosen over a full RDBMS (PostgreSQL, MySQL) for this phase because the dataset fits within a single ~49 MB database file and the access pattern is read-heavy with no concurrent writers. The dashboard runs `SELECT` queries; no transactions beyond the initial bulk `INSERT` are needed.
-
-**`flow_scores`** stores every scored flow, enabling the dashboard to perform arbitrary threshold analysis (e.g., "show me flows with anomaly score < -0.3"). **`alerts`** is a pre-filtered subset containing only IF-flagged anomalies, enabling fast dashboard load without a full-table scan.
-
-The `scored_at` timestamp column records when each row was written — useful for simulating time-series queries (e.g., alert rate over time) in the dashboard without a live streaming pipeline.
-
-### Key I/O
-| | Detail |
-|---|---|
-| **Input** | `.npy` arrays from Phases 3, 4a, 4b |
-| **Output** | `alerts.db` (~49 MB, 2 tables) |
-| **`flow_scores` rows** | 500,407 |
-| **`alerts` rows** | 85,070 |
-
-### How to run
-```bash
-make write-alerts
-```
-
----
-
-## 10. Phase 6 — Streamlit Dashboard
-
-### Flowchart
-
-```
-alerts.db
-    │
-    ├─[READ] flow_scores → anomaly score distribution histogram
-    ├─[READ] alerts → KPI cards (total anomalies, alert rate, avg score)
-    ├─[READ] alerts → attack type bar chart (rf_label breakdown)
-    ├─[READ] alerts → data table (sortable, filterable by rf_label)
-    └─[READ] alerts → top-N most anomalous flows
-        │
-        ▼
-[Streamlit server — localhost:8501]
-  ├─ Sidebar: label filter multi-select
-  ├─ Top KPIs: 4 metric cards
-  ├─ Charts: Plotly bar + histogram
-  └─ Table: paginated alert log
-```
-
-### What it does
-The dashboard is a **read-only** Streamlit application that queries `alerts.db` on every user interaction. It does not hold data in memory between sessions — each page load or filter change re-executes the relevant `SELECT` query against SQLite. This keeps memory usage negligible (the dashboard process uses <100 MB RAM) and ensures the dashboard always reflects the latest state of the database.
-
-The **sidebar filter** allows filtering the alert table and attack-type chart by RF-predicted label. This lets a user (e.g., a network analyst) isolate "show me only DoS alerts" or "show me all Bots flagged today" without touching the underlying data.
-
-The **anomaly score distribution histogram** (from `flow_scores`) is the primary tool for threshold tuning — the dashboard shows the full score spectrum so that an analyst can decide whether to tighten the contamination threshold and rerun Phase 4a.
-
-### Key I/O
-| | Detail |
-|---|---|
-| **Data source** | `alerts.db` (read-only queries) |
-| **Port** | 8501 |
-| **Charts** | Plotly bar (attack type breakdown), histogram (score distribution) |
-| **Table** | Paginated alerts log with `flow_index`, `anomaly_score`, `rf_label`, `ground_truth` |
-
-### How to run
-```bash
-make dashboard
-# Open: http://localhost:8501
-```
-
----
-
-## 11. Test Suite
-
-### Flowchart
-
-```
-tests/test_pipeline.py
-        │
-        ├─ Phase 1 checks (2):  clean_parquet/ exists, contains files
-        ├─ Phase 3 checks (5):  X_scaled.npy, y_labels.npy, scaler.joblib,
-        │                        correct shape (500,407 × 52)
-        ├─ Phase 4 checks (10): all .joblib + .npy artifacts exist,
-        │                        IF flagged non-zero rows,
-        │                        both plot PNGs exist
-        └─ Phase 5 checks (2):  alerts.db exists, row counts match
-                │
-                ▼
-        19/19 checks — exit code 0
-```
-
-### What it does
-The test suite is a **pure filesystem and shape validation** suite — it does not re-run any ML training. It checks that every expected output artifact exists, has the right dimensions, and that SQLite row counts are consistent with the flag arrays. This makes it fast (~1s) and safe to run at any time without triggering expensive recomputation.
-
-### How to run
-```bash
-make test
-```
-
----
-
-## 12. Data Flow Summary Table
-
-| Phase | Tool | Input | Output | Size |
+| Layer | Table | Partitioned by | Written by | Notes |
 |---|---|---|---|---|
-| 1 — Cleaning | PySpark 3.5.1 | `cicds.csv` (~680 MB) | `clean_parquet/` | 2,520,751 rows |
-| 2 — Streaming | Kafka 4.3.1 + Spark Structured Streaming | `clean_parquet/` | `network-flows` topic → `streaming_parquet/` | 500 rows/demo |
-| 3 — Preprocessing | pandas + scikit-learn | `clean_parquet/` | `X_scaled.npy`, `y_labels.npy`, `scaler.joblib` | 500,407 × 52 |
-| 4a — Isolation Forest | scikit-learn | `X_scaled.npy` | `if_scores.npy`, `if_flags.npy`, `isolation_forest.joblib` | 85,070 anomalies |
-| 4b — Random Forest | scikit-learn | `X_scaled.npy`, `y_labels.npy` | `rf_predictions.npy`, `random_forest.joblib` | 99.70% accuracy |
-| 4c — Evaluation | scikit-learn + matplotlib | `.npy` arrays | `models/plots/*.png` | 3 plots |
-| 5 — Storage | SQLite 3 | `.npy` arrays | `alerts.db` | 49 MB, 2 tables |
-| 6 — Dashboard | Streamlit + Plotly | `alerts.db` | Web UI at :8501 | Live |
+| Bronze | `bronze_flows` | — (a partitioned stream write sorts each batch; that ran the executor out of memory) | Q1 | Raw payload + Kafka coordinates. Replayable. |
+| Silver | `silver_flows` | `day` (capture day) | Q2 (idempotent append) | Typed, cleaned, enriched, deduplicated on `flow_uid` within each batch |
+| Silver | `silver_quarantine` | — | Q2 | Failed DQ rule + raw payload |
+| Gold | `gold_attack_timeline` | `split` | Q3a | 1-min windows × family |
+| Gold | `gold_host_profile` | `split` | Q3b | 1-min windows per host |
+| Gold | `gold_port_scan_candidates` | — | Q3b | Hosts above 50 distinct ports per window |
+| Gold | `gold_scored_flows` | `day` | Q4 | Every live flow + model output + model_version |
+| Gold | `gold_model_predictions` | `model_version` | training | Held-out test predictions per version |
+
+**Data-quality rules** (silver): `unparseable_payload`, `bad_timestamp`, `negative_duration`,
+`unknown_label`. Rows that fail are kept, not dropped, in `silver_quarantine`, and published to `flows.dlq`.
+
+**Dataset quirks handled in silver:**
+- Two timestamp formats (`dd/MM/yyyy HH:mm:ss` and `d/M/yyyy H:mm`).
+- A 12-hour clock with no AM/PM in the afternoon files (hours before 08:00 are shifted by 12h).
+- A Windows-1252 dash in the web-attack labels.
+- `Infinity` / `NaN` in the rate columns.
+- A duplicated `Fwd Header Length` column (dropped in the producer).
+- About 288K blank lines in the Thursday file (skipped in the producer).
+
+**Lakehouse operations** (`make maintenance`): `DESCRIBE DETAIL` inventory, `OPTIMIZE`
+compaction of the small files micro-batches create, `ZORDER BY (src_ip)` for data skipping on
+host lookups, `DESCRIBE HISTORY`, `VERSION AS OF` time travel, `mergeSchema` schema evolution, and `VACUUM`.
 
 ---
 
-*Generated: September 2026 · BCSE402L Big Data Analytics · VIT Chennai*
+## 6. Machine learning with MLlib
 
+`src/ml/train_pipeline.py` runs as a distributed Spark job on the cluster. It uses **all**
+backfill rows in silver, with no `toPandas()`. (The only sampling is the benign downsampling in
+the producer, described in §1.)
+
+```
+silver_flows @ version V (time travel pins the training snapshot)
+   │ filter split = 'backfill'
+   ├─ sampleBy(label_family, 0.8)  → train          (stratified)
+   └─ left_anti join on flow_uid   → test
+train ─► broadcast-join class weights √(N / (k·n_c))
+      ─► Feature PipelineModel: Imputer(median) → VectorAssembler → StandardScaler
+      ─► StringIndexer ─► RandomForestClassifier(weightCol, 50 trees, depth 10) ─► IndexToString
+      │                    (optional: make train ARGS=--cv tunes numTrees × maxDepth with a
+      │                     2-fold CrossValidator, parallelism 2; slower, off by default)
+      └─ benign rows only ─► KMeans(k=8) ─► threshold = approxQuantile(distance, 0.995)
+test  ─► macro-F1, per-class P/R/F1 (groupBy confusion matrix), ROC-AUC of P(attack) and of
+         the KMeans distance, alert precision/recall
+      ─► registry/vN/{features, rf, kmeans, meta.json}  +  Delta gold_model_predictions
+```
+
+**Two detectors, one alert rule.**
+- `rf`: the RandomForest predicts an attack family with P(attack) ≥ 0.6. This is the supervised path, for known attack families.
+- `anomaly`: the distance to the nearest *benign* centroid is above the 99.5th percentile of benign distances. This is the unsupervised path, for traffic unlike anything normal, including unseen attacks.
+
+The two can fire together (`rf+anomaly`), and `alert_reason` records which one fired.
+
+**Model registry and hot reload** (`src/ml/registry.py`): each training run writes `vN/` and
+then swaps `latest.json` atomically (write a temp file, then `os.replace`). On every micro-batch
+the scoring query reads `latest.json`, and when the version changes it loads the new
+PipelineModels without restarting the stream. Every scored row and alert carries `model_version`.
+
+The distance computation is an **Arrow-vectorised pandas UDF** (`model_utils.add_anomaly_score`),
+shared by training (to set the threshold) and by streaming (to score).
+
+---
+
+## 7. Serving and observability
+
+- **SQLite serving cache** (`data/serving/alerts.db`) holds small, query-ready tables for the
+  dashboard: alerts, host_window_stats, port_scan_candidates, stream_metrics, pipeline_events.
+  (The attack timeline and scored flows are read straight from Delta with delta-rs.) Every table has a natural primary key and
+  is written with `INSERT OR REPLACE`, so it's idempotent.
+- **StreamingQueryListener** (`metrics_listener.py`) records each micro-batch's input and
+  processed rows/s, duration, watermark, state-store rows and source end offsets. It also
+  commits bronze's processed offsets to the Kafka consumer group `spark-bronze-ingest`. Spark
+  normally keeps offsets only in its checkpoint, so without that commit, consumer lag would be
+  invisible to Kafka UI.
+- **Dashboard** (`src/dashboard/app.py`, no Spark) has 5 tabs:
+  - live pipeline: throughput, batch latency, per-partition Kafka lag
+  - threat timeline
+  - hosts: top talkers, port scans
+  - alert feed
+  - lakehouse & model: Delta versions read via delta-rs, metrics, plots
+- **Spark UIs:** the master on :8081, the streaming tab on :4040, and event logs in `data/spark-events`.
+
+---
+
+## 8. Fault tolerance and delivery guarantees
+
+| Hop | Guarantee | Mechanism |
+|---|---|---|
+| producer → Kafka | exactly-once per partition | idempotent producer, `acks=all`, RF=3, min.ISR=2 |
+| Kafka → bronze | exactly-once | Kafka offsets in the checkpoint + Delta transactional sink |
+| bronze → silver | exactly-once | Delta source versions in the checkpoint + Delta idempotent write (`txnAppId`/`txnVersion`) |
+| silver → quarantine / gold_scored | exactly-once | Delta idempotent writes (`txnAppId` = query, `txnVersion` = batch id) |
+| silver → gold windows | exactly-once | stateful aggregation in the checkpoint + MERGE on window keys |
+| → SQLite | effectively once | `INSERT OR REPLACE` on natural keys |
+| → Kafka flows.scored / alerts / dlq | at-least-once | the Kafka batch sink can re-send when a micro-batch is retried |
+
+You can test this by killing the streaming app at any point and restarting it. There will be no
+duplicate `flow_uid`s in silver, in `gold_scored` or in SQLite alerts. The test suite asserts the
+same thing by replaying micro-batches.
+
+---
+
+## 9. Big data concepts → where in the code
+
+| Concept | Where |
+|---|---|
+| **Volume:** 2.83M flows × 85 columns (1.0M replayed in the demo), all processed distributed | `replay_producer.py`, `silver.py`, `train_pipeline.py` |
+| **Velocity:** continuous micro-batches, paced event-time replay | `stream_app.py`, `replay_producer.py --speedup` |
+| **Variety / veracity:** raw strings, mixed timestamp formats, Inf/NaN, bad records | `silver.parse`, DQ rules, quarantine + DLQ |
+| Distributed log, partitions, message keys | `create_topics.py`, producer `key=source_ip` |
+| Replication, ISR, broker fault tolerance (full cluster, `LITE=0`) | `docker-compose.yml` (RF=3, min.ISR=2), `create_topics --describe` |
+| Idempotent producer, acks, batching, compression | `replay_producer.make_producer` |
+| Consumer offsets, replay, consumer lag | bronze checkpoint, `metrics_listener._commit_offsets`, dashboard lag chart |
+| Backpressure | `maxOffsetsPerTrigger` (bronze), producer queue `poll()` |
+| Kappa architecture | the whole design; see §1 |
+| Structured Streaming micro-batches, triggers, checkpoints | every module in `src/streaming/`, `config.trigger()` |
+| Event time vs processing time | `silver.parse_event_time`, `event_time` vs `ingest_ts` |
+| Watermarks and late data | `gold.timeline_agg`, `gold.host_agg` |
+| Tumbling windows (sliding is one config value away) | `gold.timeline_agg`, `gold.host_agg` (1 min); `host_window`/`host_slide` in `pipeline.yaml` |
+| Approximate distinct counting (HyperLogLog++) | `approx_count_distinct` in `gold.py` |
+| RocksDB state store | `spark.py` (`stateStore.providerClass`) |
+| Stream-static broadcast join | `silver.enrich` (`F.broadcast(dim_subnets / dim_ports)`) |
+| foreachBatch multi-sink fan-out | `silver.write_batch`, `scoring.write_batch`, `gold._write_*` |
+| Exactly-once / idempotent sinks | `lake.idempotent_append`, `lake.merge_upsert`, `sqlite_sink.upsert` |
+| Medallion lakehouse | `bronze.py` → `silver.py` → `gold.py` / `scoring.py` |
+| Delta: ACID, MERGE, idempotent writes, Delta-as-stream-source | `lake.py`, `gold._write_*` (MERGE), `silver.write_batch` (idempotent append) |
+| Delta: time travel, history, schema evolution | `train_pipeline` (`versionAsOf`), `maintenance.py` |
+| Partitioning, partition pruning, small-file compaction, Z-ordering | partitionBy in each writer, day-pruned MERGE, `maintenance.py` |
+| Columnar storage (Parquet under Delta), predicate pushdown | all Delta reads, e.g. the `split = 'live'` filter in scoring and `split = 'backfill'` in training |
+| Adaptive Query Execution, shuffle partitions | `spark.py` |
+| Spark standalone cluster, executors, FAIR scheduling, cores.max | `docker-compose.yml`, `spark.py` |
+| MLlib Pipelines, distributed training | `model_utils.feature_pipeline`, `train_pipeline.py` |
+| Distributed hyperparameter tuning (optional) | `make train ARGS=--cv` → `CrossValidator(parallelism=2)` |
+| Class imbalance handling at scale | broadcast class weights, `weightCol` |
+| Stratified sampling | `sampleBy` + `left_anti` |
+| Vectorised (Arrow) pandas UDFs | `model_utils.add_anomaly_score` |
+| Model registry, versioning, hot swap | `registry.py`, `scoring.write_batch` |
+| Stream monitoring | `metrics_listener.py`, Spark UI, Kafka UI, dashboard |
+
+---
+
+## 10. Limitations and honest caveats
+
+- **This is one laptop.** The cluster is real (separate JVMs, network shuffle, replication),
+  but every container shares one 8 GB machine. Throughput numbers show the design working, not
+  production capacity.
+- **The shared filesystem is a bind mount**, standing in for HDFS or S3. Delta's
+  single-writer-per-table assumption holds because each table has exactly one writing query.
+- **The Kafka batch sinks are at-least-once** (see §8). Consumers of `flows.scored` and `alerts`
+  should dedupe on `flow_uid`.
+- **SQLite** is a serving cache for a single dashboard, not a scalable serving store. In
+  production it would be Cassandra, Elasticsearch or Postgres. The idempotent upsert pattern stays the same.
+- **The test suite uses synthetic, CICIDS-shaped data** (`tests/synthetic.py`) and runs without
+  Docker. Its metrics are perfect only because the synthetic families are separable. Real
+  numbers come from `make train` / `make evaluate` on the real dataset.
+- **CICIDS2017 is a lab capture.** Very rare classes (Infiltration ≈ 36 flows, Heartbleed ≈ 11)
+  can't be learned reliably by any model, and that shows up in the per-class metrics.

@@ -1,0 +1,75 @@
+# docker/docker-compose.lite.yml — DEFAULT profile: 1 KRaft broker (RF=1) + Kafka UI + Spark master + 1 worker.
+# Sized for an 8 GB Mac with Docker at 6 GB (the 3-broker / 2-worker cluster kept running out of memory).
+# Same images, ports and mounts as the full cluster; the Makefile sets KAFKA_RF=1. Full cluster: LITE=0.
+
+x-spark: &spark
+  build: ./spark
+  image: adp-spark:3.5.3
+  user: root
+  volumes:
+    - ..:/opt/app
+  environment:
+    SPARK_NO_DAEMONIZE: "true"
+    SPARK_DAEMON_MEMORY: 256m
+    KAFKA_BOOTSTRAP: kafka-1:19092
+    KAFKA_RF: "1"
+
+services:
+  kafka-1:
+    image: apache/kafka:3.8.0
+    hostname: kafka-1
+    ports: ["9092:9092"]
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xmx320m -Xms320m"
+    volumes: [kafka-lite:/var/lib/kafka/data]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.0.0
+    ports: ["8080:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: cicids-lite
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:19092
+      JAVA_OPTS: "-Xmx192m"
+    mem_limit: 320m
+    depends_on:
+      kafka-1: {condition: service_healthy}
+
+  spark-master:
+    <<: *spark
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8081"]
+    ports: ["8081:8081", "4040:4040", "4041:4041"]
+    mem_limit: 2560m
+
+  spark-worker-1:
+    <<: *spark
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--cores", "2", "--memory", "2000m", "spark://spark-master:7077"]
+    # One worker gets the memory freed by the 2 removed brokers and 2nd worker:
+    # room for the stream's two 1-core executors (2 x 800m heap) plus off-heap
+    mem_limit: 3g
+    depends_on: [spark-master]
+
+volumes:
+  kafka-lite:     # separate from the full cluster's kafka1..3 volumes, which stay untouched
