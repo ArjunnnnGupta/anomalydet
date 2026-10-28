@@ -27,7 +27,7 @@ from src.common.config import cfg, kafka_bootstrap, lake, replication_factor, to
 from src.ml import registry
 from src.serving.sqlite_sink import db_path
 
-st.set_page_config(page_title="Kappa Flow Anomaly Platform", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Network Anomaly Platform", page_icon="🛡️", layout="wide")
 
 NORMAL = cfg()["ml"]["normal_label"]
 RECENT_MINUTES = 30          # live charts show only the most recent activity
@@ -130,7 +130,7 @@ def ago(ts: pd.Timestamp) -> str:
 
 
 # ── Header + sidebar ───────────────────────────────────────────────────────────
-st.title("🛡️ Kappa Network-Flow Anomaly Platform")
+st.title("🛡️ Network Anomaly Platform")
 st.caption(f"Kafka (RF={replication_factor()}) → Spark Structured Streaming → Delta Lake (bronze/silver/gold) "
            "→ MLlib RandomForest + KMeans → real-time alerts · CICIDS2017")
 
