@@ -105,7 +105,34 @@ picks up the new flows from Kafka and pushes them through the steps below.
 - It remembers how far it got (**checkpoints**). If it crashes, it continues from the same spot,
   with no data lost and none processed twice.
 
-The work is done in layers: bronze → silver → gold.
+### The 5 queries that `make stream` starts
+
+A **query** is one continuous job inside the Spark program. When `make stream` starts, it prints
+these 5 names, and you'll see the same names on the dashboard's **Live pipeline** tab:
+
+| Query name | What it does | Why it's needed | Explained in |
+|---|---|---|---|
+| `q1_bronze` | Reads new flows from Kafka and saves an exact raw copy | Keeps the original data safe, so it can be re-processed later | Step 5 |
+| `q2_silver` | Cleans and checks each flow; sends broken ones to quarantine | Everything after this needs clean, trustworthy data | Step 6 |
+| `q3a_gold_timeline` | Counts flows per minute for each attack type | Answers "what kind of attacks are happening right now?" | Step 7 |
+| `q3b_gold_hosts` | Counts each computer's activity per minute; spots port scans | Answers "which computer is attacking?" | Step 7 |
+| `q4_scoring` | Runs the trained model on every live flow and raises alerts | This is the actual attack detection | Step 9 |
+
+**How they connect:** each query feeds the next, like an assembly line:
+
+```
+Kafka ─► q1_bronze ─► q2_silver ─┬─► q3a_gold_timeline   (attacks per minute)
+                                 ├─► q3b_gold_hosts      (per-computer activity, port scans)
+                                 └─► q4_scoring          (model → alerts)
+```
+
+**Why 5 separate queries instead of one big one:**
+- **Each has one simple job,** so it's easy to understand, test and fix.
+- **They run at the same time,** sharing the cluster's two CPU cores.
+- **Each keeps its own checkpoint (bookmark).** If one is slow or restarts, the others aren't affected.
+- **Each saves its result as a table,** so every stage can be inspected on its own.
+
+The rest of this guide follows the same order: bronze → silver → gold → scoring.
 
 ---
 
