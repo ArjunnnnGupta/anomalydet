@@ -1,7 +1,7 @@
 # BIG DATA ANALYTICS (BCSE402L)
-## Digital Assignment 2 / Review 2 Report: Progress & Application
+## Digital Assignment 3 / Review 3 Report: Final Implementation
 **Institution:** Vellore Institute of Technology (VIT Chennai), School of Computer Science and Engineering (SCOPE)  
-**Project Title:** Flow-Level Network Anomaly Detection Platform  
+**Project Title:** Kappa-Architecture Network-Flow Anomaly Detection Platform  
 **Team Members:**  
 - Arjun Gupta — [Registration Number]  
 - [Team Member 2] — [Registration Number]  
@@ -9,334 +9,232 @@
 
 ---
 
-## 1. Application of Concepts
+## 1. Summary of Changes Since Review 2
 
-The project applies distributed data processing with Apache Spark (PySpark 3.5.1), columnar analytical storage with Apache Parquet, event stream processing with Apache Kafka, and lightweight ML anomaly detection on network flow records from the CICIDS2017 dataset. For Review 2 (Midway Progress), the complete pipeline—from distributed cleaning and feature preprocessing of **2,520,751 network flows** to machine learning model evaluation, SQLite alert indexing, and an interactive Streamlit dashboard—has been implemented and verified.
+In Review 2 the pipeline was batch-oriented: Spark cleaned a CSV into Parquet, a 500K-row sample was pulled into pandas, scikit-learn trained the models, and Kafka was a side demo that streamed 500 rows. For Review 3 the project was rebuilt as a **streaming-first big data pipeline**:
 
-### 1.1 Implemented Pipeline
-
-```
-┌────────────────────────────────────────────────────────┐
-│                   Raw Network Flows                    │
-│             (CICIDS2017: 2,520,751 records)            │
-└──────────────────────────┬─────────────────────────────┘
-                           │
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│            PySpark Distributed Data Cleaning           │
-│   - Schema enforcement & whitespace removal            │
-│   - Infinity / NaN sanitization & null filtering       │
-│   - Zero-variance column detection across 52 features  │
-└──────────────────────────┬─────────────────────────────┘
-                           │
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│             Columnar Parquet Analytical Store          │
-│                (data/clean_parquet/)                   │
-└──────────────┬───────────────────────────┬─────────────┘
-               │                           │
-               ▼                           ▼
-┌──────────────────────────────┐ ┌──────────────────────────────┐
-│  Kafka Streaming Ingestion   │ │   PySpark & Scikit-Learn     │
-│  - JSON Event Producer       │ │   Feature Preprocessing      │
-│  - Spark Structured Consumer │ │   - StandardScaler scaling   │
-│  - data/streaming_parquet/   │ │   - X_scaled.npy (500k × 52) │
-└──────────────────────────────┘ └──────────────┬───────────────┘
-                                                │
-                                                ▼
-                                 ┌──────────────────────────────┐
-                                 │    Machine Learning Engine   │
-                                 │ - IsolationForest (Unsup.)   │
-                                 │ - RandomForest (Supervised)  │
-                                 └──────────────┬───────────────┘
-                                                │
-                                                ▼
-                                 ┌──────────────────────────────┐
-                                 │   SQLite Alert Serving Cache │
-                                 │   - flow_scores (500k rows)  │
-                                 │   - alerts (85k flagged rows)│
-                                 └──────────────┬───────────────┘
-                                                │
-                                                ▼
-                                 ┌──────────────────────────────┐
-                                 │   Streamlit Web Dashboard    │
-                                 │   - Real-time KPI summary    │
-                                 │   - Attack classification bar│
-                                 │   - Anomaly score histogram  │
-                                 │   - Searchable alert feed    │
-                                 └──────────────────────────────┘
-```
-*Figure 1 — Implemented end-to-end Big Data architecture and execution pipeline.*
-
----
-
-### 1.2 Big Data Technique: Distributed Ingestion and Cleaning with Spark
-
-Rather than loading millions of records into standard Python memory (which causes Out-Of-Memory crashes on local machines), the raw dataset is ingested through PySpark's lazy execution engine. PySpark distributes the workload across 8 parallel worker threads with explicit driver memory bounding (`--driver-memory 2g`):
-
-```python
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType
-
-# Initialize optimized local Spark cluster
-spark = (
-    SparkSession.builder
-    .master("local[*]")
-    .appName("clean_data")
-    .config("spark.driver.memory", "2g")
-    .config("spark.sql.shuffle.partitions", "8")
-    .getOrCreate()
-)
-
-# Distributed lazy CSV read with schema inference
-df = spark.read.csv("data/raw/cicds.csv", header=True, inferSchema=True)
-df = df.toDF(*[c.strip() for c in df.columns])
-feature_cols = [c for c in df.columns if c != "Attack Type"]
-
-# Parallel column type casting to DoubleType
-for col in feature_cols:
-    df = df.withColumn(col, F.col(col).cast(DoubleType()))
-```
-
----
-
-### 1.3 Spark Transformations and Feature Engineering
-
-Network intrusion logs frequently suffer from division-by-zero anomalies (yielding positive/negative infinities in packet inter-arrival times and flow byte rates). The pipeline transforms these values to `null` and filters corrupt records using Spark DataFrame expressions:
-
-```python
-# Replace Inf/-Inf with null, then drop null rows across all 52 features
-for col in feature_cols:
-    df = df.withColumn(
-        col,
-        F.when(F.col(col).isin([float("inf"), float("-inf")]), None)
-         .otherwise(F.col(col))
-    )
-df_clean = df.dropna()
-
-# Detect and drop zero-variance columns (constant values offering no information)
-stats = df_clean.select(
-    [F.stddev(F.col(c)).alias(c) for c in feature_cols]
-).collect()[0].asDict()
-zero_var_cols = [c for c, std in stats.items() if std is None or std == 0.0]
-df_clean = df_clean.drop(*zero_var_cols)
-
-# Persist cleaned dataset as partitioned Parquet
-df_clean.write.mode("overwrite").parquet("data/clean_parquet/")
-```
-
----
-
-## 2. Project Progress
-
-### 2.1 Dataset Collection
-
-Data was obtained from the **CICIDS2017** benchmark dataset (Kaggle pre-extracted flow dataset). It comprises **2,520,751 network flow records** across **53 attributes** (52 continuous network statistical metrics such as Flow Duration, Total Fwd Packets, Packet Length Variance, Flow IAT Mean, and 1 multi-class label attribute `Attack Type`).
-
-### 2.2 Environment Setup
-
-| Component | Version / Tool | Purpose |
+| Area | Review 2 | Review 3 (final) |
 |---|---|---|
-| **Operating System** | macOS (Apple Silicon ARM64) | Development & runtime host environment |
-| **Language Runtime** | Python 3.13.2 | Core pipeline orchestration & scripting |
-| **Java Development Kit** | OpenJDK 17 LTS | JVM runtime required by Apache Spark 3.5.1 |
-| **Distributed Engine** | Apache Spark / PySpark 3.5.1 | Distributed cleaning, filtering, and partitioning |
-| **Streaming Broker** | Apache Kafka (KRaft mode) | Real-time event pub/sub decoupling |
-| **Analytical Store** | Apache Parquet (via pyarrow) | Columnar, compressed intermediate storage |
-| **Serving Database** | SQLite 3 (`alerts.db`) | Indexed hot storage for sub-second UI queries |
-| **Machine Learning** | scikit-learn 1.6+ | Isolation Forest & Random Forest models |
-| **Dashboard** | Streamlit 1.37+ | Interactive web visualization dashboard |
-| **Visualizations** | Plotly 5.23+ & Matplotlib 3.9+ | Dynamic interactive charts and confusion matrices |
+| Architecture | Batch scripts, Kafka as a side demo | **Kappa architecture**: Kafka is the only way data enters |
+| Dataset | Kaggle `cicds.csv` (no IPs, no timestamps) | **Original CICIDS2017 TrafficLabelling CSVs**: 2,830,743 flows with IPs, ports and timestamps |
+| Processing | Spark batch cleaning, then pandas | **Spark Structured Streaming**: 4 continuous stages |
+| Storage | Parquet files + `.npy` arrays | **Delta Lake** medallion lakehouse (bronze → silver → gold) |
+| Machine learning | scikit-learn on a 500K sample | **Spark MLlib** on the full lake the stream built |
+| Analytics | Per-flow only | **Event-time windows** per attack type and per source host, port-scan detection |
+| Serving | Static SQLite tables | Live alerts, Kafka output topics, real-time dashboard |
+| Deployment | Local Python scripts | **Docker Compose** cluster: Kafka (KRaft) + Spark standalone |
+
+Review 2's planned items were Kafka streaming integration and real-time alerting. Both are delivered: flows stream through Kafka into Spark Structured Streaming, and alerts are produced continuously to a Kafka `alerts` topic and the dashboard. SHAP explainability was replaced by MLlib's feature importances (Section 5.2).
 
 ---
 
-### 2.3 Data Ingestion Output
-
-All 2.52M records were parsed, verified, and partitioned in Spark:
+## 2. System Architecture
 
 ```
-============================================================
-Phase 1 — Data Cleaning
-============================================================
-[1/6] Loading data/raw/cicds.csv ...
-[Stage 1:==============>                               (2 + 6) / 8]
-[Stage 2:>                                             (0 + 8) / 8]
-Raw shape: 2,520,751 rows × 53 columns
-
-[2/6] Label distribution (raw):
-+--------------+-------+
-|Attack Type   |count  |
-+--------------+-------+
-|Normal Traffic|2095057|
-|DoS           |193745 |
-|DDoS          |128014 |
-|Port Scanning |90694  |
-|Brute Force   |9150   |
-|Web Attacks   |2143   |
-|Bots          |1948   |
-+--------------+-------+
+ CICIDS2017 CSVs (8 days, 2.83M flows)
+        │  replay producer: event-time paced, keyed by Source IP, idempotent, lz4
+        ▼
+ ┌────────── Apache Kafka (KRaft, no ZooKeeper) ──────────┐
+ │  flows.raw (12 partitions) · flows.scored · alerts · DLQ │
+ └──────────────────────────┬──────────────────────────────┘
+                            ▼
+ ┌──────── Spark Structured Streaming (one app) ───────────┐
+ │ Q1 BRONZE  Kafka → Delta: raw records + offsets         │
+ │ Q2 SILVER  parse · validate · enrich → Delta            │
+ │            bad records → quarantine table + DLQ topic   │
+ │ Q3 GOLD    1-min windows per attack type & per host,     │
+ │            port-scan candidates → Delta (MERGE)          │
+ │ Q4 SCORE   MLlib RandomForest + KMeans → alerts          │
+ └──────────────────────────┬──────────────────────────────┘
+          ▼                  ▼                    ▼
+   Delta Lake tables   Kafka alerts topic   SQLite serving cache
+          │                                       │
+   MLlib training job                     Streamlit dashboard
+   (model registry, hot reload)
 ```
-*Figure 2 — PySpark distributed ingestion and raw class distribution output.*
+
+**Kappa vs. Lambda.** A Lambda architecture keeps a separate batch path and a streaming path. Here there is a single path: every record enters through Kafka, and every table is built by stream processing. Reprocessing means replaying the log (Kafka or a Delta table) through the same code.
+
+**Two passes through Kafka.** The model must be trained before live traffic can be scored, so the data is split with a deterministic hash:
+1. **Backfill (80%)** is replayed at full speed. The stream builds the lakehouse, and MLlib trains on it.
+2. **Live (20%, held out)** is replayed paced to real time, re-stamped to the current clock. The stream scores every flow as it arrives. Because these flows were never used in training, live scoring is also a genuine held-out evaluation.
 
 ---
 
-### 2.4 Data Preprocessing
+## 3. Big Data Concepts Applied
 
-During Phase 1 and Phase 3:
-* Initial volume: **2,520,751 records**.
-* Sanitization: Null and infinite values verified; 0 records required dropping as the cleaned Kaggle export already resolved malformed lines.
-* Zero-variance check: All 52 statistical features exhibited non-zero standard deviation across flows.
-* Feature normalization: Features were scaled using `StandardScaler` to ensure zero-mean and unit-variance $(\mu = 0, \sigma = 1)$ before unsupervised anomaly partitioning.
-* Memory management: A representative stratified sample of 500,407 records was extracted for local machine learning model fitting to strictly observe the 8GB unified memory budget.
-
----
-
-## 3. Methods & Tools Used
-
-| Technology | Purpose / Technical Justification |
+| Concept | Where it is applied |
 |---|---|
-| **Apache Spark / PySpark** | Provides distributed in-memory parallel computation across CPU cores, eliminating single-threaded memory bottlenecks for multi-million-row transformations. |
-| **Spark SQL** | Declarative SQL interface for rapid aggregation, distribution calculation, and data validation. |
-| **Apache Parquet** | Columnar binary format offering high compression ratios (~70% reduction vs CSV) and query predicate pushdown. |
-| **Apache Kafka (KRaft)** | Decouples network flow generation from stream ingestion without requiring legacy ZooKeeper daemons, minimizing memory overhead. |
-| **Isolation Forest** | Efficient $\mathcal{O}(n \log n)$ unsupervised tree-based anomaly detection algorithm that isolates anomalies by randomly partitioning feature space. |
-| **Random Forest Classifier** | Supervised ensemble of decision trees providing multi-class attack attribution and validation of flagged anomalies. |
-| **SQLite** | Embedded relational engine providing indexed, low-latency queries for the dashboard without the RAM overhead of a running database server. |
-| **Streamlit & Plotly** | Reactive Python-native web application framework providing real-time data refreshing and interactive filtering. |
+| **Distributed log, partitioning, keys** | `flows.raw` has 12 partitions. Keying by Source IP keeps each host's flows in order on one partition |
+| **Replication and fault tolerance** | Full cluster: 3 brokers, replication factor 3, `min.insync.replicas=2`, producer `acks=all` (verified: every partition had all 3 replicas in sync) |
+| **Idempotent producer, batching, compression** | `enable.idempotence`, `linger.ms`, 256 KB batches, lz4 |
+| **Backpressure** | `maxOffsetsPerTrigger` (Kafka) and `maxFilesPerTrigger` / `maxBytesPerTrigger` (Delta) cap each micro-batch |
+| **Micro-batch stream processing** | Spark Structured Streaming, 5-second triggers, one checkpoint per query |
+| **Exactly-once processing** | Kafka offsets in checkpoints + Delta transactional sinks + idempotent writes (`txnAppId` / `txnVersion`) |
+| **Event time and watermarks** | Windows use the flow's own timestamp. A 10-minute watermark tolerates out-of-order data and bounds state |
+| **Windowed aggregation** | 1-minute tumbling windows per attack type and per source host, with `approx_count_distinct` (HyperLogLog) for distinct ports and destinations |
+| **Stateful streaming** | Open windows are kept in the RocksDB state store and checkpointed |
+| **Broadcast joins** | Small subnet and port→service dimension tables are broadcast-joined onto the stream |
+| **Medallion lakehouse** | Delta Lake bronze (raw) → silver (clean) → gold (aggregates, scored flows) |
+| **ACID, MERGE, time travel** | Gold tables are upserted with MERGE. Training pins the exact silver version it read (`versionAsOf`) |
+| **Partition pruning and file skipping** | MERGE conditions include literal partition and min-timestamp predicates so Delta skips old data |
+| **Lakehouse maintenance** | OPTIMIZE (small-file compaction), Z-ORDER by source IP, DESCRIBE HISTORY, schema evolution, VACUUM |
+| **Distributed ML** | MLlib Pipelines on the full training set, distributed class weighting, optional CrossValidator |
+| **Vectorised UDFs** | Arrow-based pandas UDF computes the KMeans anomaly distance |
+| **Model registry and hot swap** | Versioned models. The scoring query reloads the newest version without a restart |
+| **Data quality** | 4 validation rules. Failing records go to a quarantine table and a dead-letter topic instead of being dropped |
 
-### 3.1 Spark SQL for Traffic Analysis
+---
 
-Spark SQL views enable declarative queries over the cleaned Parquet store:
+## 4. Implementation
+
+### 4.1 Dataset
+
+The original CICIDS2017 *GeneratedLabelledFlows* CSVs from UNB (8 files, 1.2 GB, 85 columns): **2,830,743 flows** from 3–7 July 2017, with 15 attack labels mapped to 8 families (Normal, DoS, DDoS, Port Scanning, Brute Force, Web Attacks, Bots, Infiltration).
+
+Dataset issues handled in the silver layer:
+- Two timestamp formats, and 12-hour times without AM/PM in the afternoon files.
+- `Infinity` / `NaN` values in the rate columns.
+- A duplicated column, Windows-1252 characters in labels, and about 288K blank lines.
+
+For a laptop-sized demo, the producer keeps **every attack flow and 20% of benign flows**: **1,012,310 flows** (557,646 attacks + 454,664 benign), split into 809,632 backfill and 202,678 live.
+
+### 4.2 Streaming application
+
+One Spark application runs four stages (five queries):
 
 ```python
-df.createOrReplaceTempView("network_flows")
+# Q1 bronze: Kafka → Delta, backpressure via maxOffsetsPerTrigger
+spark.readStream.format("kafka").option("subscribe", "flows.raw") \
+     .option("maxOffsetsPerTrigger", 20000).load()
 
-spark.sql("""
-    SELECT 
-        `Attack Type`,
-        COUNT(*) AS flow_count,
-        ROUND(AVG(`Flow Duration`), 2) AS avg_duration_us,
-        ROUND(AVG(`Flow Bytes/s`), 2) AS avg_throughput_bps
-    FROM network_flows
-    GROUP BY `Attack Type`
-    ORDER BY flow_count DESC
-""").show(truncate=False)
+# Q3 gold: event-time window per source host, with watermark
+silver.withWatermark("event_time", "10 minutes") \
+      .groupBy(F.window("event_time", "1 minute"), "split", "src_ip") \
+      .agg(F.count("*").alias("flows"),
+           F.approx_count_distinct("dst_port").alias("distinct_dst_ports"))
 ```
+
+Hosts touching more than 50 distinct ports in one minute are flagged as **port-scan candidates**. On the real data, the attacker address `172.16.0.1` contacted 1,034 distinct ports within single minutes.
+
+### 4.3 Machine learning (Spark MLlib)
+
+- **Features:** 70 numeric flow features, put through Imputer → VectorAssembler → StandardScaler.
+- **Supervised model:** RandomForest (50 trees, depth 10) with class weights against the imbalance. It predicts the attack family and P(attack).
+- **Unsupervised model:** KMeans (k = 8) trained on benign traffic only. The anomaly score is the distance to the nearest centroid, with a threshold at the 99.5th percentile of benign distances.
+- **Alert rule:** alert if the RandomForest predicts an attack with P ≥ 0.6, **or** the KMeans distance exceeds the threshold.
+- Trained on **647,533 rows** (silver, backfill split, version 9) and tested on 162,029 held-out rows.
+
+### 4.4 Deployment
+
+A Docker Compose cluster: Kafka in KRaft mode, Kafka UI, a Spark standalone master and worker(s), all sharing the project folder as the lakehouse filesystem. Two profiles:
+- **Lite (default, used for the demo):** 1 Kafka broker and 1 Spark worker, sized for an 8 GB laptop.
+- **Full (`LITE=0`):** 3 Kafka brokers with replication and 2 Spark workers.
+
+The code is identical in both; only the cluster size changes.
 
 ---
 
-## 4. Explanation of Work Completed
+## 5. Results
 
-### 4.1 Attack Vector and Flow Distribution
+### 5.1 Model performance
 
-The dataset reflects a realistic class imbalance typical of production network monitoring: benign traffic comprises 83.1% of flows, while malicious intrusions account for 16.9% across six distinct threat categories:
+| Metric | Held-out test (162,029 flows) | Live stream (19,985 flows) |
+|---|---|---|
+| Alert precision (alerts that were real attacks) | **0.992** | **0.995** |
+| Alert recall (real attacks that raised an alert) | **0.996** | **0.991** |
+| RandomForest ROC-AUC | 0.9997 | 0.9998 |
+| KMeans anomaly ROC-AUC | 0.709 | 0.786 |
+| Accuracy (attack family) | 0.995 | — |
+| Macro-F1 (attack family) | 0.907 | 0.598* |
 
-| Attack Category | Flow Count | Percentage | Primary Traffic Characteristic |
-|---|---|---|---|
-| **Normal Traffic** | 2,095,057 | 83.11% | Balanced forward/backward packet size and natural IAT |
-| **DoS (Denial of Service)** | 193,745 | 7.69% | High packet counts, abnormal packet length variance |
-| **DDoS (Distributed DoS)** | 128,014 | 5.08% | Mass volumetric bursts, low inter-arrival times |
-| **Port Scanning** | 90,694 | 3.60% | Rapid probe connections with minimal payload data |
-| **Brute Force** | 9,150 | 0.36% | Repeated authentication attempts to identical ports |
-| **Web Attacks** | 2,143 | 0.09% | Small packet bursts targeting HTTP/HTTPS endpoints |
-| **Bots** | 1,948 | 0.08% | Periodic command-and-control heartbeat communication |
-| **Total** | **2,520,751** | **100.00%** | Full cleaned dataset |
+\*The live macro-F1 comes from a small partial sample in which the rare families have only a handful of flows; the binary precision and recall are unaffected.
 
----
+**Per-family results (held-out test):**
 
-## 5. Machine Learning Evaluation and Dashboard
+| Family | Precision | Recall | F1 | Flows |
+|---|---|---|---|---|
+| Normal Traffic | 0.997 | 0.992 | 0.994 | 73,148 |
+| DoS | 0.992 | 0.997 | 0.994 | 40,110 |
+| Port Scanning | 0.998 | 0.999 | 0.999 | 25,466 |
+| DDoS | 1.000 | 0.999 | 0.999 | 20,463 |
+| Brute Force | 1.000 | 0.994 | 0.997 | 2,184 |
+| Web Attacks | 0.812 | 0.893 | 0.851 | 335 |
+| Bots | 0.621 | 0.956 | 0.753 | 315 |
+| Infiltration | 1.000 | 0.500 | 0.667 | 8 |
 
-### 5.1 Unsupervised Anomaly Detection (Isolation Forest)
+The large families are detected almost perfectly. Macro-F1 (0.907) is pulled down by the three rare families. Infiltration has only 8 test flows, so one miss halves its recall.
 
-The unsupervised `IsolationForest` model was trained on the scaled 52-dimensional continuous feature matrix without providing attack labels during training:
-* **Hyperparameters**: `n_estimators=100`, `contamination=0.17` (calibrated against empirical 16.9% attack baseline), `n_jobs=-1`.
-* **Detection Output**: Flagged **85,070 flows** (17.00% of the scored sample) as anomalous.
-* **Separation**: The decision function exhibits distinct negative score shifts for attack flows, demonstrating that unsupervised trees effectively isolate malicious vectors.
+**Which model fires.** On live traffic, 10,234 alerts came from the RandomForest alone, 120 from both models and 31 from KMeans alone. The supervised model does most of the work, and KMeans adds a safety net for traffic that does not look like anything normal.
 
-```
-Isolation Forest Binary Evaluation (Benign vs Attack):
-              precision    recall  f1-score   support
-  Benign (0)       0.90      0.90      0.90    415,979
-  Attack (1)       0.49      0.50      0.50     84,428
-    accuracy                           0.83    500,407
-```
+**Most important features** (RandomForest): destination port, backward packets/s, subflow forward bytes, maximum forward packet length, initial TCP window size, average backward segment size.
 
-### 5.2 Supervised Multi-Class Attribution (Random Forest)
+**Caveat.** Keeping only 20% of benign traffic makes attacks about 55% of the replayed data, against about 20% in the original capture. Precision on real-world traffic, where attacks are rare, would be lower.
 
-To cross-validate flagged flows and categorize threat types, a supervised `RandomForestClassifier` was trained on an 80/20 stratified split:
-* **Training Set**: 400,325 flows | **Test Set**: 100,082 flows.
-* **Accuracy**: **99.70%** overall multi-class test accuracy.
-* **Class Performance**: Precision and recall reached $\ge 0.99$ for DoS, DDoS, Port Scanning, and Normal Traffic.
+### 5.2 Streaming run
 
-```
-Random Forest Multi-Class Evaluation:
-                precision    recall  f1-score   support
-          Bots       0.28      0.97      0.43        78
-   Brute Force       1.00      1.00      1.00       365
-          DDoS       1.00      1.00      1.00     5,048
-           DoS       0.99      1.00      1.00     7,733
-Normal Traffic       1.00      1.00      1.00    83,196
- Port Scanning       0.99      1.00      0.99     3,584
-   Web Attacks       0.97      0.95      0.96        78
-      accuracy                           1.00   100,082
-```
+On the lite cluster, a demo replay of **30,235 live flows** went through Kafka → bronze → silver → scoring end to end with no data loss, raising **16,872 alerts**. Kafka consumer lag returned to zero once the replay finished.
 
-### 5.3 Interactive Streamlit Dashboard
+### 5.3 Dashboard
 
-The Streamlit dashboard (`src/dashboard/app.py`) reads directly from `alerts.db` without reprocessing the multi-gigabyte raw dataset:
-1. **Executive Metric Cards**: Total flows scored (500,407), total anomalies flagged (85,070), flag rate (17.0%), average anomaly score (0.0824).
-2. **Threat Distribution Chart**: Dynamic Plotly bar chart displaying flagged volumes across attack categories.
-3. **Anomaly Score Distribution**: Histogram illustrating score divergence between normal and abnormal flows.
-4. **Interactive Alert Feed**: Filterable, paginated table displaying individual flow indices, anomaly scores, predicted labels, and timestamps.
+The Streamlit dashboard has five tabs:
+- **Live pipeline:** per-query throughput, micro-batch duration, Kafka consumer lag per partition, and stream status.
+- **Threat timeline:** alerts per minute by attack family, with precision and recall against ground truth.
+- **Hosts:** top alerting source hosts, port-scan candidates, and per-host traffic windows.
+- **Alert feed:** filterable alerts, each marked correct or incorrect against ground truth.
+- **Lakehouse & model:** Delta table versions and files, the gold attack timeline, model metrics (held-out vs. live), the confusion matrix and feature importance.
+
+### 5.4 Testing
+
+18 automated tests (pytest) run the real streaming queries on synthetic CICIDS-shaped data. They cover: parsing and data-quality quarantine, idempotent replay, windowed aggregation and port-scan detection, MLlib training and registration, live scoring into Delta and SQLite, model hot reload, evaluation, and Delta maintenance.
 
 ---
 
 ## 6. Team Participation
 
-| Team Member | Core Responsibilities & Contributions |
+| Team Member | Contributions in Review 3 |
 |---|---|
-| **Arjun Gupta**<br>[Registration Number] | Architecture design; macOS ARM64 environment configuration; OpenJDK 17 and PySpark 3.5.1 distributed setup; raw dataset ingestion; data cleaning, null/inf handling, and Parquet storage pipeline; Streamlit dashboard implementation; report preparation. |
-| **[Team Member 2]**<br>[Registration Number] | Feature engineering & scaling with `StandardScaler`; machine learning pipeline development (`IsolationForest` anomaly scoring and `RandomForestClassifier` multi-class training); evaluation scripts and metric plot generation; SQLite database schema and alert caching; pipeline testing & validation. |
-
-*This technical division ensures that one member spearheaded the Big Data ingestion, transformation, and presentation layers, while the second member spearheaded feature preprocessing, ML modeling, and storage caching.*
+| **Arjun Gupta**<br>[Registration Number] | [fill in] |
+| **[Team Member 2]**<br>[Registration Number] | [fill in] |
 
 ---
 
-## 7. Current Project Status
+## 7. Project Status
 
-| Component | Status | Deliverable / Output |
-|---|---|---|
-| CICIDS2017 Dataset Collection & Symlink | **Completed** | Raw 2.52M row CSV in `data/raw/` |
-| PySpark Local Engine Configuration | **Completed** | Driver memory capped at 2GB, 8 worker threads |
-| Distributed Cleaning & Type Enforcement | **Completed** | 2,520,751 rows verified in `clean_data.py` |
-| Analytical Columnar Parquet Store | **Completed** | Partitioned files in `data/clean_parquet/` |
-| Per-Flow Feature Preprocessing & Scaling | **Completed** | `data/X_scaled.npy` and `models/scaler.joblib` |
-| Unsupervised Anomaly Detection (Isolation Forest) | **Completed** | `models/isolation_forest.joblib` (85k alerts) |
-| Supervised Multi-Class Classifier (Random Forest) | **Completed** | `models/random_forest.joblib` (99.7% accuracy) |
-| Evaluation Metrics & Confusion Matrix Visualizations | **Completed** | Plots saved in `models/plots/` |
-| SQLite Hot Serving Alert Cache | **Completed** | `alerts.db` populated with indexed queries |
-| Streamlit Web Visualization Dashboard | **Completed** | Live reactive dashboard on `localhost:8501` |
-| Automated Pipeline Sanity Test Suite | **Completed** | `tests/test_pipeline.py` (19/19 checks passing) |
-| Live Kafka Streaming Ingestion (Phase 2) | **In Progress** | Scripts authored (`kafka_producer.py`, `spark_consumer.py`); broker setup underway |
-| Explainable AI (SHAP Feature Importance) | **Planned — Review 3** | SHAP summary plots for top anomaly indicators |
-| Real-time Alert Notification Webhook | **Planned — Review 3** | Automated webhook dispatch on critical threats |
+| Component | Status |
+|---|---|
+| Kafka ingestion (replay producer, topics, partitioning, dead-letter topic) | **Completed** |
+| Spark Structured Streaming: bronze, silver, gold, scoring | **Completed** |
+| Delta Lake lakehouse and maintenance job | **Completed** |
+| MLlib training, model registry, hot reload, evaluation | **Completed** |
+| Streamlit dashboard | **Completed** |
+| Docker Compose deployment (lite and full profiles) | **Completed** |
+| Automated test suite (18 tests) | **Completed** |
 
 ---
 
 ## 8. Challenges Encountered
 
-* **Memory-Constrained Distributed Processing**: Parsing and transforming 2.52 million rows with 53 continuous attributes on an 8GB unified memory machine posed high risk of memory swapping and system freeze. This was resolved by capping PySpark's driver memory to 2GB, partitioning shuffle stages, and transitioning from raw CSV to compressed Parquet.
-* **Dataset Structure Realignment**: The raw Kaggle-cleaned CICIDS2017 dataset omits Source IP and Timestamp headers, preventing sliding-window per-host profiling. The project scope was deliberately adapted to **per-flow anomaly detection**—treating each network connection independently while maintaining the complete distributed Big Data pipeline.
+These problems all came up when running on the real cluster with the full dataset:
+
+* **Kafka deleted the data minutes after it arrived.** The producer stamped records with their original 2017 timestamps, and Kafka's time-based retention (48 hours) treated them as years old. The record timestamp is now the send time, with the event time carried in the payload. The bronze source also now fails loudly on missing data instead of skipping it.
+* **Memory on an 8 GB laptop.** Executors and the driver were repeatedly killed for exceeding container limits. Fixes included:
+  - capping every micro-batch, not only the Kafka read
+  - removing a sort caused by a partitioned stream write
+  - spreading the stream over two small executors
+  - never running a batch job alongside the stream
+  - using the single-broker, single-worker profile for the demo
+* **Slow deduplication.** A MERGE-based duplicate check re-scanned the whole silver table on every micro-batch (about 2.5 minutes per batch). It was replaced with Delta's idempotent append, and the gold MERGEs were given partition-pruning predicates.
+* **Silently skipped writes after a checkpoint reset.** Delta's idempotent write used the query name as its ID. After a checkpoint reset the batch numbers restarted at 0, so Delta treated them as already written. The ID now includes the streaming query's unique ID, as Delta recommends.
+* **Python 3.8 in the Spark image.** The official Spark 3.5.3 image ships Python 3.8. Library versions were pinned accordingly, and the code kept 3.8-compatible.
 
 ---
 
 ## 9. Conclusion and Future Work
 
-For Review 2 (Digital Assignment 2), the Flow-Level Network Anomaly Detection Platform has successfully built and verified an end-to-end Big Data cybersecurity pipeline. Over 2.52 million network flows are parsed and cleaned with Apache Spark, stored in columnar Parquet, normalized, evaluated using unsupervised and supervised machine learning models, cached in SQLite, and rendered through an interactive Streamlit dashboard.
+The final system is an end-to-end Kappa-architecture big data pipeline. Network flows enter only through Kafka. Spark Structured Streaming builds a Delta Lake lakehouse continuously, Spark MLlib trains on it, and live traffic is scored in real time. On held-out data, 99.2% of alerts were real attacks and 99.6% of attacks raised an alert. Results appear on a live dashboard and a Kafka alerts topic.
 
-### Planned for Review 3 (Final Phase):
-1. **Full Kafka Streaming Integration**: Execute continuous real-time flow simulation from Kafka into Spark Structured Streaming micro-batches.
-2. **Model Explainability with SHAP**: Integrate SHAP (SHapley Additive exPlanations) values to identify specific flow features (e.g. `Flow Bytes/s`, `Packet Length Variance`) driving individual anomaly flags.
-3. **Production Alerting**: Implement automated notifications for high-confidence security alerts.
-
+**Future work:**
+1. Run on a multi-node cluster with the full 2.83M flows and no benign downsampling, to measure precision on realistic traffic.
+2. Improve the rare families (Bots, Web Attacks, Infiltration) with more training examples or oversampling.
+3. Add per-alert explanations (for example SHAP) and an automated notification channel subscribed to the `alerts` topic.
