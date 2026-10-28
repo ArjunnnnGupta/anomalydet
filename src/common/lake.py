@@ -9,6 +9,7 @@ import os
 
 from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
 from pyspark.sql.types import StructType
 
 from src.common.config import cfg, checkpoint
@@ -39,9 +40,11 @@ def merge_upsert(spark: SparkSession, df: DataFrame, path: str, keys: list[str],
         if vals:
             cond += f" AND t.`{prune_partitions}` IN ({', '.join(repr(str(v)) for v in vals)})"
     if min_col:
-        lo = df.agg({min_col: "min"}).collect()[0][0]
+        # Format inside Spark (session time zone), so the literal is parsed in the same zone.
+        # collect() would return the driver's LOCAL time zone and shift the cutoff (seen on IST).
+        lo = df.agg(F.date_format(F.min(min_col), "yyyy-MM-dd HH:mm:ss.SSSSSS")).collect()[0][0]
         if lo is not None:
-            cond += f" AND t.`{min_col}` >= TIMESTAMP'{lo:%Y-%m-%d %H:%M:%S}'"
+            cond += f" AND t.`{min_col}` >= TIMESTAMP'{lo}'"
     (DeltaTable.forPath(spark, path).alias("t").merge(df.alias("s"), cond)
      .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
 

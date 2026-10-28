@@ -372,3 +372,13 @@ Ran the stream against a small live sample (`make live LIVE_PCT=2 SPEEDUP=0`, 4,
 ## Checkpoint 19: Dashboard re-verified; Threat-timeline KPIs made consistent (2026-10-28)
 
 The headless render of all tabs on the current data showed no exceptions. It did show **"Alerts raised 29,496 — 122.7% of flows"** and a capped "100%" recall: the SQLite alerts included the 16,872 from the 30K run whose scored rows never reached `gold_scored` (the txnAppId bug). The headline KPIs now all come from Delta `gold_scored`: 24,045 flows, 12,624 alerts, 99.4% precision, 99.2% recall, identical to `make evaluate-live`. The per-minute chart still shows every alert from the serving cache.
+
+---
+
+## Checkpoint 20: `make demo-reset`, plus a MERGE time-zone bug (2026-10-28)
+
+- **Practice run note:** `make live` finishing means everything has been *sent*. The user then stopped the stream, so only ~3,000 of ~30,000 flows were scored. For the demo, keep the stream running until Kafka lag is 0. A smaller replay (`LIVE_PCT=5 SPEEDUP=300`, ~10K flows) lets the stream keep up.
+- **New `make demo-reset`** (`src/serving/demo_reset.py`, which has `--dry-run`): for a fresh demo, it clears live-split rows from the four gold Delta tables (with delta-rs), clears the dashboard's SQLite serving tables, removes the bronze checkpoint, and recreates the Kafka topics empty. It keeps the model, the backfill bronze/silver data, the backfill gold windows, the evaluation files and the other checkpoints. It refuses to run while the stream is running and asks for confirmation.
+- **Verified on a copy of `gold_host_profile`:** the delta-rs delete removed exactly the 10,775 live rows, and Spark could then read the table and MERGE into it.
+- **Bug found by that test:** the gold MERGE's `window_start >=` cutoff was built from `collect()`, which returns the driver's *local* time zone, while Spark parsed the literal in UTC. On the Mac (IST, +5:30) this shifted the cutoff, missed matches and inserted duplicates. The cluster runs in UTC, so the real runs weren't affected. The cutoff is now formatted inside Spark (`date_format`, in the session time zone). Re-test: 0 duplicates, 5 of 5 keys updated in place.
+- `pytest` → 18 passed.

@@ -43,7 +43,7 @@ ARGS       ?=
 
 .PHONY: help setup test build cluster-up cluster-down cluster-ps logs topics topics-describe \
         stream stream-bg stream-logs stream-catchup produce backfill live inject-bad wait train evaluate \
-        evaluate-live maintenance dashboard report report-da2 reset
+        evaluate-live maintenance dashboard report report-da2 demo-reset reset
 
 help:
 	@grep -E '^## ' Makefile | sed 's/## //'
@@ -151,6 +151,13 @@ report:
 report-da2:
 	$(PY) generate_report_pdf.py
 
+
+## demo-reset       fresh demo: clear previous live results + empty Kafka (keeps model and backfill)
+demo-reset:
+	$(NO_STREAM)
+	@read -p "Clear previous live-run results and empty the Kafka topics? [y/N] " a; [ "$$a" = "y" ] || exit 1
+	$(PY) -m src.serving.demo_reset
+	$(PY) -m src.ingestion.create_topics --recreate
 
 ## reset            wipe the lake, checkpoints, registry and SQLite, and recreate the topics
 reset:
