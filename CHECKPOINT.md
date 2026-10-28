@@ -366,3 +366,9 @@ Ran the stream against a small live sample (`make live LIVE_PCT=2 SPEEDUP=0`, 4,
   - the architecture diagram is redrawn with aligned borders
 - New `generate_report_da3_pdf.py` builds **Digital_Assignment_3_Report.pdf** (9 pages, A4) from REPORT.md, with DejaVu fonts (arrows, box drawing) and the 4 evaluation figures as an appendix. Every page was rendered and checked. `make report` → DA3, `make report-da2` → old PDF.
 - The PDF itself is git-ignored (`*.pdf`); regenerate it with `make report`.
+
+---
+
+## Checkpoint 19: Dashboard re-verified; Threat-timeline KPIs made consistent (2026-10-28)
+
+The headless render of all tabs on the current data showed no exceptions. It did show **"Alerts raised 29,496 — 122.7% of flows"** and a capped "100%" recall: the SQLite alerts included the 16,872 from the 30K run whose scored rows never reached `gold_scored` (the txnAppId bug). The headline KPIs now all come from Delta `gold_scored`: 24,045 flows, 12,624 alerts, 99.4% precision, 99.2% recall, identical to `make evaluate-live`. The per-minute chart still shows every alert from the serving cache.

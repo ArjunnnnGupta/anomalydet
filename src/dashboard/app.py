@@ -80,14 +80,17 @@ def delta_table(name: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=15)
-def scored_totals() -> tuple[int, int]:
-    """(live flows scored, ground-truth attacks among them) from Delta gold_scored."""
+def scored_totals() -> dict:
+    """Headline numbers from ONE source, Delta gold_scored, so they always agree with each other
+    (and with `make evaluate-live`): flows scored, alerts, true positives, real attacks."""
     try:
         from deltalake import DeltaTable
-        t = DeltaTable(lake("gold_scored")).to_pyarrow_table(columns=["is_attack"])
-        return t.num_rows, int(sum(x or 0 for x in t.column("is_attack").to_pylist()))
+        t = DeltaTable(lake("gold_scored")).to_pyarrow_table(columns=["is_alert", "is_attack"]).to_pydict()
+        alert, attack = t["is_alert"], t["is_attack"]
+        return {"flows": len(alert), "alerts": sum(1 for x in alert if x),
+                "tp": sum(1 for x, y in zip(alert, attack) if x and y), "attacks": sum(1 for y in attack if y)}
     except Exception:  # noqa: BLE001
-        return 0, 0
+        return {"flows": 0, "alerts": 0, "tp": 0, "attacks": 0}
 
 
 @st.cache_data(ttl=30)
@@ -215,16 +218,16 @@ with tab_threats:
     if a.empty:
         st.info("No alerts yet. Start the stream (`make stream`) and replay the held-out flows (`make live`).")
     else:
-        scored, attacks = scored_totals()
-        n_alerts, n_tp = int(a.alerts.sum()), int(a.true_attacks.sum())
+        t = scored_totals()
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Live flows scored", f"{scored:,}", help="Rows in Delta gold_scored (every live flow the model scored).")
-        k2.metric("Alerts raised", f"{n_alerts:,}",
-                  f"{n_alerts / scored:.1%} of flows" if scored else None, delta_color="off")
-        k3.metric("Alerts that were real attacks", f"{n_tp / n_alerts:.1%}",
+        k1.metric("Live flows scored", f"{t['flows']:,}", help="Rows in Delta gold_scored (every live flow the model scored).")
+        k2.metric("Alerts raised", f"{t['alerts']:,}",
+                  f"{t['alerts'] / t['flows']:.1%} of flows" if t["flows"] else None, delta_color="off")
+        k3.metric("Alerts that were real attacks", f"{t['tp'] / t['alerts']:.1%}" if t["alerts"] else "—",
                   help="Precision: share of alerts whose ground-truth label is an attack.")
-        k4.metric("Real attacks caught", f"{min(n_tp / attacks, 1):.1%}" if attacks else "—",
-                  help="Recall: alerts on real attacks ÷ all real attacks among the scored flows.")
+        k4.metric("Real attacks caught", f"{t['tp'] / t['attacks']:.1%}" if t["attacks"] else "—",
+                  help="Recall: share of the real attacks among the scored flows that raised an alert.")
+        st.caption("Headline numbers: Delta gold_scored. Chart: every alert in the serving cache.")
         st.subheader("Alerts per minute by predicted attack family")
         a["minute"] = pd.to_datetime(a["minute"])
         st.plotly_chart(px.bar(a, x="minute", y="alerts", color="predicted_family", height=380,
