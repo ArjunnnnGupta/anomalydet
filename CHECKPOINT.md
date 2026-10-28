@@ -311,3 +311,29 @@ Rendered every tab headless (Streamlit AppTest) against the real run's data and 
 - **Lakehouse & model:** "live" numbers no longer appear as red/green change arrows. A switch selects held-out vs live metrics, each metric has a help tooltip, per-class support shows as integers, and a caption shows the evaluated row count.
 
 Verified: no exceptions on any tab, and the metrics switch works.
+
+---
+
+## Checkpoint 16: Lite default, consistency review, two more real-cluster bugs (2026-10-28)
+
+**Switched to the lite profile (now the default):** 1 Kafka broker (RF=1), Kafka UI, Spark master and 1 worker (2 cores, 3 GB container). The full cluster is kept with `LITE=0`, and its Kafka volumes are untouched. On lite, the stream runs as two 1-core executors on the one worker. The full cluster's catch-up had failed again with an executor OOM-killed during a gold MERGE.
+
+**Moving to lite without replaying the backfill:** kept the Delta lake and model v1, reset only the checkpoints that referred to the old Kafka (`q1_bronze`) or to the unscored backlog (gold and scoring), and started once with `make stream SKIP_BACKLOG=1`. That flag makes a query with no checkpoint start at its source table's current end. The old stream_metrics rows were cleared because they referred to the old Kafka.
+
+**Demo-sized replays:** `make live` replays a deterministic 15% sample of the held-out flows (`LIVE_PCT`, `--sample-pct`). Long commands run under `caffeinate -i`, because the Mac sleeping mid-run had killed the stream.
+
+**Consistency review (code ↔ config ↔ docs):** every config key, lake table, Kafka topic and SQLite table is used consistently.
+- Removed dead outputs: `score_stats` and the `window_stats` SQLite mirror.
+- Removed the unused `merge_upsert` parameters.
+- `make wait` now orders by time instead of batch id, which resets with a new checkpoint.
+- Fixed stale docstrings and docs: silver "MERGE", the Makefile header workflow, port 4041, and the dashboard links.
+
+**Real-cluster run on lite:** a 30,235-flow demo replay was scored end to end with no memory kills, raising 16,872 alerts. Batches were slow (30–160 s) and alerts trailed the replay by a few minutes.
+
+**Bugs found and fixed**
+1. The gold MERGE re-scanned the whole gold table every batch. It now adds literal `split IN (...)` (partition pruning) and `window_start >= min` (file skipping) predicates.
+2. **Scored rows were silently dropped from Delta `gold_scored`** after a checkpoint reset. The idempotent-write `txnAppId` was the query name, batch ids restarted at 0, and Delta skipped batches 0–9 as "already written". The txnAppId is now name + query id (read from the checkpoint's `metadata`), as Delta recommends. Alerts were unaffected (they went to SQLite and Kafka). New test: `tests/test_lake.py`.
+
+**Verified:** `pytest` → 18 passed. Pushed to branch `kappa-streaming-pipeline`.
+
+**Not yet verified on the cluster:** fixes 1 and 2 (a stream restart and a demo replay are needed), and `make evaluate-live` on the new rows.
