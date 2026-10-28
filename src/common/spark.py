@@ -38,6 +38,10 @@ def get_spark(app: str, master: str | None = None, streaming: bool = False) -> S
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
         .config("spark.sql.adaptive.skewJoin.enabled", "true")
         .config("spark.sql.shuffle.partitions", str(s["shuffle_partitions"]))
+        # Delta rebuilds its transaction-log snapshot with 50 partitions by default (sized for big
+        # clusters). On 2 cores every Delta-reading micro-batch queued 50 tiny tasks and scoring
+        # starved, so a 15-row batch took minutes. Match it to the cluster instead.
+        .config("spark.databricks.delta.snapshotPartitions", str(s["delta_snapshot_partitions"]))
         .config("spark.sql.autoBroadcastJoinThreshold", str(10 * 1024 * 1024))
         # Streaming state lives in RocksDB (off-heap), not the JVM heap
         .config("spark.sql.streaming.stateStore.providerClass",

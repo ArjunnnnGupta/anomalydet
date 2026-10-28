@@ -337,3 +337,18 @@ Verified: no exceptions on any tab, and the metrics switch works.
 **Verified:** `pytest` → 18 passed. Pushed to branch `kappa-streaming-pipeline`.
 
 **Not yet verified on the cluster:** fixes 1 and 2 (a stream restart and a demo replay are needed), and `make evaluate-live` on the new rows.
+
+---
+
+## Checkpoint 17: Fixes verified on the lite cluster; Delta snapshot starvation fixed (2026-10-28)
+
+Ran the stream against a small live sample (`make live LIVE_PCT=2 SPEEDUP=0`, 4,060 flows) rather than a full rehearsal.
+
+- **The txnAppId fix works.** `gold_scored` went from 19,985 to **24,045** rows: exactly the 4,060 sample flows, starting at scoring batch 10. Under the old scheme, batch 10 would have been skipped as "already written". Alerts went from 27,257 to 29,496.
+- **New finding, CPU starvation.** The Spark REST API showed the stages blocking scoring and silver each had **50 tasks**: Delta's default `spark.databricks.delta.snapshotPartitions=50` for rebuilding the transaction-log snapshot. On 2 cores, every Delta-reading micro-batch queued 50 tiny tasks. It is now set to 4 (`spark.delta_snapshot_partitions`). After the restart no stage has more than 8 tasks.
+- **Gold MERGE pruning, combined with the snapshot fix.** Host-profile MERGE scan time went from 76–248 s per batch (Oct 20) to 4–27 s, and total MERGE time from 116–362 s to 5–41 s.
+- **Batch times now:** scoring 12–23 s (was 48–138 s), gold hosts 7–33 s (was 140–363 s), gold timeline 27–96 s.
+- A duplicate stream app (mine) was started by mistake while another was already running. It sat in WAITING with 0 cores and touched no data, and was stopped. The `make stream-bg` guard does not check for an existing stream app.
+- `pytest` → 18 passed. The stream is stopped.
+
+**Still open:** a timed demo rehearsal (`make stream` + `make live SPEEDUP=600`), and `make evaluate-live` on the larger live set (now 24,045 flows) so REPORT.md §5.1 can be updated.

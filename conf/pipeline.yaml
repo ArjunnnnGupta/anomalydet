@@ -35,6 +35,7 @@ kafka:
 
 spark:
   shuffle_partitions: 8
+  delta_snapshot_partitions: 4          # Delta default 50 starved a 2-core cluster (see src/common/spark.py)
   executor_memory: 800m                 # heap; + 256m direct memory + RocksDB 128m must fit the 1800m worker container
   executor_direct_memory: 256m          # caps off-heap (Netty/Kafka buffers): 900m heap + uncapped off-heap got OOM-killed
   executor_cores: 2                     # batch jobs (train / evaluate / maintenance): one 2-core executor per worker
