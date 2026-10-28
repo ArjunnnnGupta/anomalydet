@@ -27,6 +27,7 @@ a newly registered version without a code change or redeploy.
          (RandomForest + KMeans, model registry) ─► SQLite serving cache ─► Streamlit dashboard
 ```
 
+The simplest starting point is **[WORKFLOW.md](WORKFLOW.md)**: the step-by-step flow and a glossary of terms.
 A plain-language walkthrough of every component (what, where, why, which big data concept) is in
 **[PROJECT_GUIDE.md](PROJECT_GUIDE.md)**. The full design, with a map from each big data concept to the code that uses it, is in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 Build progress is logged in [CHECKPOINT.md](CHECKPOINT.md).
