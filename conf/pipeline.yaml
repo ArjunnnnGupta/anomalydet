@@ -36,12 +36,11 @@ kafka:
 spark:
   shuffle_partitions: 8
   delta_snapshot_partitions: 4          # Delta default 50 starved a 2-core cluster (see src/common/spark.py)
-  executor_memory: 800m                 # heap; + 256m direct memory + RocksDB 128m must fit the 1800m worker container
-  executor_direct_memory: 256m          # caps off-heap (Netty/Kafka buffers): 900m heap + uncapped off-heap got OOM-killed
-  executor_cores: 2                     # batch jobs (train / evaluate / maintenance): one 2-core executor per worker
+  executor_memory: 800m                 # heap per executor; + 256m direct memory + RocksDB 128m, x2 fits the 3 GB worker
+  executor_direct_memory: 256m          # caps off-heap (Netty/Kafka buffers): uncapped off-heap got OOM-killed
+  executor_cores: 2                     # batch jobs (train / evaluate / maintenance): one 2-core executor
   stream_executor_cores: 1              # streaming app: 1-core executors ...
-  stream_cores_max: 2                   # ... x2 = one per worker. A single 2-core executor put all the work on
-                                        # worker-1 and got OOM-killed while worker-2 sat idle.
+  stream_cores_max: 2                   # ... x2 on the worker's 2 cores (one 2-core executor ran out of memory).
                                         # Batch jobs run only while the stream is stopped (no room for 2 drivers in 6 GB).
   driver_memory: 768m
   event_log_dir: data/spark-events
