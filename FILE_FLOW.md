@@ -9,6 +9,101 @@ needed.
 
 ---
 
+## How to explain this to the professor (easy script)
+
+If you're asked to "explain the flow file by file", follow the data, not the folders. Start where
+the data comes in, end where it's shown, and say one or two simple lines per file. Have these
+files open in the editor, in this order, and click through them as you talk.
+
+### The one-breath summary (say this first)
+
+> "The data starts as CSV files. A **producer** sends each row into **Kafka**. One always-running
+> **Spark** program picks the rows up and passes them through **bronze** (raw copy), **silver**
+> (cleaned) and **gold** (summaries). A **training** script teaches the models using silver, and
+> a **scoring** step uses those models to raise alerts on new traffic. The **dashboard** shows the
+> results."
+
+### Then walk through the files (10 steps)
+
+**1. `conf/pipeline.yaml`: the settings file**
+> "All the settings are in one file: topic names, how many partitions, the window size, the
+> model settings. Every other file reads from here, so nothing is hard-coded."
+
+**2. `docker/docker-compose.lite.yml`: starts the machines**
+> "This starts Kafka, the Kafka UI, a Spark master and a Spark worker as containers, so one
+> laptop behaves like a small cluster."
+
+**3. `src/ingestion/create_topics.py`: creates the Kafka topics**
+> "This creates the 4 Kafka topics. `flows.raw`, with 12 partitions, is where all incoming data
+> goes."
+
+**4. `src/ingestion/replay_producer.py`: sends the data into Kafka**
+> "We don't have a real network, so this program pretends to be one. It reads the CSV rows in time
+> order and sends each one to Kafka. It splits them 80% for training and 20% kept hidden for live
+> testing. The key is the source IP, so one computer's traffic stays in order."
+
+**5. `src/streaming/stream_app.py`: the main Spark program**
+> "This is the heart of the project. It's one Spark program that runs all the time and starts 5
+> queries, one for each stage of the pipeline."
+
+**6. `src/streaming/bronze.py`: query 1, raw copy**
+> "This reads from Kafka and saves every message exactly as it arrived, into the bronze Delta
+> table. It's our backup of the original data."
+
+**7. `src/streaming/silver.py`: query 2, cleaning**
+> "This cleans the data: it fixes the timestamps, turns broken numbers like Infinity into empty
+> values, tidies the labels into 8 attack families, removes duplicates, and moves bad records to
+> a quarantine table instead of deleting them. The clean data goes into silver."
+> *(It uses `schemas.py` for column names and labels, and `dims.py` for the zone and port lookup tables.)*
+
+**8. `src/streaming/gold.py`: queries 3a and 3b, summaries**
+> "This counts the traffic per minute: attacks per minute, and for each computer, how many
+> connections and how many different ports. Any computer that touches more than 50 ports in a
+> minute is flagged as a port scanner."
+
+**9. `src/ml/train_pipeline.py` → `src/streaming/scoring.py`: the machine learning**
+> "The training script learns from the 80% history in silver. A RandomForest learns the known
+> attack types, and KMeans learns what normal traffic looks like. It saves the models as version 1
+> in the model registry (`registry.py`). Then query 4, `scoring.py`, loads that model *while the
+> stream is running*, checks every new live flow, and raises an alert if either model says
+> 'attack'. Alerts go to Kafka, to Delta and to SQLite."
+
+**10. `src/dashboard/app.py`: the dashboard**
+> "This is the web page. It reads the alerts and stats from SQLite and the Delta tables, and
+> shows live throughput, attacks per minute, the top attackers and the alert feed, with a tick or
+> cross showing whether each alert was right."
+
+### If the professor asks about the "helper" files
+
+| File | One line in easy words |
+|---|---|
+| `Makefile` | "Shortcuts: each step is one command, like `make stream` or `make train`." |
+| `src/common/config.py` | "Reads the settings file and gives every other file the right paths and addresses." |
+| `src/common/spark.py` | "Starts Spark the same way everywhere, with Delta switched on and memory limits set." |
+| `src/common/lake.py` | "Small helpers for saving to Delta safely, so a batch is never saved twice." |
+| `src/ml/model_utils.py` | "The feature preparation and alert rule, shared by training and scoring, so both treat data exactly the same." |
+| `src/streaming/metrics_listener.py` | "Records the speed of every batch, which the dashboard shows." |
+| `src/serving/sqlite_sink.py` | "Saves results into a small, fast database that the dashboard reads." |
+| `src/ml/evaluate.py` | "Measures how accurate the model is on data it never saw." |
+| `src/lakehouse/maintenance.py` | "Delta housekeeping: compacts small files, shows table history and time travel." |
+| `src/serving/demo_reset.py` | "Clears the live results so the dashboard starts fresh for a new demo." |
+| `tests/` | "18 automatic tests that run the real pipeline on small fake data." |
+
+### Tips
+
+- **Follow the data:** CSV → producer → Kafka → bronze → silver → gold / scoring → dashboard. If you lose your place, go back to this line.
+- **For each file, say three things:** what goes in, what it does, and what comes out.
+- **Show, don't just say:** while explaining `silver.py`, point at `parse_event_time` or the data-quality rules; for `gold.py`, point at the `window(...)` and `approx_count_distinct`.
+- **Know where each big data concept lives:**
+  - partitions → producer and Kafka
+  - exactly-once and checkpoints → bronze and `lake.py`
+  - watermark and windows → gold
+  - broadcast join → silver
+  - Delta time travel → training
+  - distributed ML → `train_pipeline.py`
+
+---
+
 ## The whole flow at a glance
 
 ```
