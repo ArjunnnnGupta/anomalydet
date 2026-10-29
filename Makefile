@@ -143,7 +143,7 @@ maintenance:
 dashboard:
 	PYTHONPATH=. $(VENV)/bin/streamlit run src/dashboard/app.py
 
-## report           build Digital_Assignment_3_Report.pdf from REPORT.md (+ evaluation plots)
+## report           build Digital_Assignment_3_Report.pdf (VIT format) from REPORT.md + figures redrawn from the lake
 report:
 	$(PY) generate_report_da3_pdf.py
 

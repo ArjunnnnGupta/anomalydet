@@ -382,3 +382,11 @@ The headless render of all tabs on the current data showed no exceptions. It did
 - **Verified on a copy of `gold_host_profile`:** the delta-rs delete removed exactly the 10,775 live rows, and Spark could then read the table and MERGE into it.
 - **Bug found by that test:** the gold MERGE's `window_start >=` cutoff was built from `collect()`, which returns the driver's *local* time zone, while Spark parsed the literal in UTC. On the Mac (IST, +5:30) this shifted the cutoff, missed matches and inserted duplicates. The cluster runs in UTC, so the real runs weren't affected. The cutoff is now formatted inside Spark (`date_format`, in the session time zone). Re-test: 0 duplicates, 5 of 5 keys updated in place.
 - `pytest` → 18 passed.
+
+---
+
+## Checkpoint 21: DA3 report in the VIT format (2026-10-29)
+
+- The report now matches the team's reference layout (`BigData_DA3_Report.pdf`): US Letter pages, a border on every page, Times New Roman, a VIT cover page (logo in `assets/vit_logo.png`, team and guide from the front matter of REPORT.md), black-grid tables, inline "Figure N:" captions, and the sections Abstract, 1–7.
+- New `report_figures.py` redraws the 8 figures from the current lake with delta-rs: architecture, families, hourly activity, throughput, F1 per class, feature importance, live alerts and port scans. `make report` runs it first, so the charts always match the data.
+- The numbers are current and verified. Live: 27,099 scored flows, 12,649 alerts, precision 99.19% and recall 99.21%, 102 false positives. The Kafka section shows the lite/full replication factors (1/3) instead of claiming 3 brokers. 13 pages; every page was rendered and checked.
