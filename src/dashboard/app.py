@@ -4,8 +4,8 @@ src/dashboard/app.py — live operations dashboard for the Kappa pipeline (runs 
 
 Data sources (no Spark needed in this process):
   • SQLite serving cache  (written by the streaming app's foreachBatch + listener)
-  • Delta gold tables     (read directly with delta-rs / `deltalake`)
-  • Model registry        (meta.json, metrics*.json, plots)
+  • Delta gold_scored     (read directly with delta-rs / `deltalake`)
+  • Model registry        (meta.json, metrics*.json)
   • Kafka                 (partition high-watermarks → consumer lag)
   • Spark master REST     (is the streaming app running?)
 
@@ -23,7 +23,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from src.common.config import cfg, kafka_bootstrap, lake, replication_factor, topic
+from src.common.config import cfg, kafka_bootstrap, lake, topic
 from src.ml import registry
 from src.serving.sqlite_sink import db_path
 
@@ -70,15 +70,6 @@ def kafka_watermarks() -> tuple[dict, str]:
         return {}, str(e)
 
 
-@st.cache_data(ttl=30)
-def delta_table(name: str) -> pd.DataFrame:
-    try:
-        from deltalake import DeltaTable
-        return DeltaTable(lake(name)).to_pandas()
-    except Exception:  # noqa: BLE001
-        return pd.DataFrame()
-
-
 @st.cache_data(ttl=15)
 def scored_totals() -> dict:
     """Headline numbers from ONE source, Delta gold_scored, so they always agree with each other
@@ -91,19 +82,6 @@ def scored_totals() -> dict:
                 "tp": sum(1 for x, y in zip(alert, attack) if x and y), "attacks": sum(1 for y in attack if y)}
     except Exception:  # noqa: BLE001
         return {"flows": 0, "alerts": 0, "tp": 0, "attacks": 0}
-
-
-@st.cache_data(ttl=30)
-def delta_info(name: str) -> dict | None:
-    try:
-        from deltalake import DeltaTable
-        dt = DeltaTable(lake(name))
-        hist = dt.history(5)
-        return {"table": name, "version": dt.version(), "files": len(dt.file_uris()),
-                "partitions": ", ".join(dt.metadata().partition_columns) or "—",
-                "last_op": hist[0].get("operation") if hist else "—"}
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def latest_model() -> tuple[int | None, dict, dict, dict]:
@@ -131,7 +109,7 @@ def ago(ts: pd.Timestamp) -> str:
 
 # ── Header + sidebar ───────────────────────────────────────────────────────────
 st.title("🛡️ Network Anomaly Platform")
-st.caption(f"Kafka (RF={replication_factor()}) → Spark Structured Streaming → Delta Lake (bronze/silver/gold) "
+st.caption("Kafka → Spark Structured Streaming → Delta Lake (bronze/silver/gold) "
            "→ MLlib RandomForest + KMeans → real-time alerts · CICIDS2017")
 
 running = stream_running()
@@ -151,11 +129,10 @@ with st.sidebar:
                 "- [Running Spark app](http://localhost:4040) (stream, or a batch job)\n"
                 "- [Streaming queries](http://localhost:4040/StructuredStreaming/)")
 
-tab_live, tab_threats, tab_hosts, tab_feed, tab_lake = st.tabs(
-    ["📡 Live pipeline", "🚨 Threat timeline", "🖥️ Hosts", "📜 Alert feed", "🗄️ Lakehouse & model"])
+tab_pipe, tab_alerts, tab_model = st.tabs(["📡 Pipeline", "🚨 Alerts", "🧠 Model & hosts"])
 
-# ── 1. Live pipeline ───────────────────────────────────────────────────────────
-with tab_live:
+# ── 1. Pipeline: is data flowing and is the stream keeping up? ─────────────────
+with tab_pipe:
     m = q("SELECT * FROM stream_metrics ORDER BY ts DESC LIMIT 5000")
     if running is False:
         st.warning("The streaming app is not running, so the numbers below are from its last run. "
@@ -193,172 +170,94 @@ with tab_live:
             st.plotly_chart(px.line(recent, x="ts", y="processed_rps", color="query_name", markers=True,
                                     height=320, labels={"processed_rps": "rows/s", "ts": ""}),
                             width="stretch")
-        c3, c4 = st.columns(2)
-        with c3:
-            st.subheader("Micro-batch duration")
-            st.plotly_chart(px.line(recent, x="ts", y="batch_duration_ms", color="query_name", markers=True,
-                                    height=300, labels={"batch_duration_ms": "ms", "ts": ""}),
-                            width="stretch")
-        with c4:
-            st.subheader("Query state")
-            st.dataframe(last[["batch_id", "num_input_rows", "processed_rps", "batch_duration_ms",
-                               "watermark", "state_rows"]], width="stretch")
         st.caption(f"Charts show the last {RECENT_MINUTES} minutes of recorded micro-batches.")
-    ev = q("SELECT ts, source, message FROM pipeline_events ORDER BY ts DESC LIMIT 15")
-    if not ev.empty:
-        st.subheader("Pipeline events")
-        st.dataframe(ev, width="stretch", hide_index=True)
 
-# ── 2. Threat timeline ─────────────────────────────────────────────────────────
-# Built from the alerts table (SQLite) and the Delta gold_scored table.
-with tab_threats:
-    a = q("SELECT substr(event_time, 1, 16) AS minute, predicted_family, COUNT(*) AS alerts, "
-          "SUM(CASE WHEN label_family != ? THEN 1 ELSE 0 END) AS true_attacks "
-          "FROM alerts GROUP BY 1, 2 ORDER BY 1", (NORMAL,))
+# ── 2. Alerts: what was detected, and was it right? ────────────────────────────
+with tab_alerts:
+    a = q("SELECT substr(event_time, 1, 16) AS minute, predicted_family, COUNT(*) AS alerts "
+          "FROM alerts GROUP BY 1, 2 ORDER BY 1")
     if a.empty:
-        st.info("No alerts yet. Start the stream (`make stream`) and replay the held-out flows (`make live`).")
+        st.info("No alerts yet. Start the stream (`make stream`) and replay the held-out flows (`make live`). "
+                "The first scoring batch takes a minute or two.")
     else:
         t = scored_totals()
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Live flows scored", f"{t['flows']:,}", help="Rows in Delta gold_scored (every live flow the model scored).")
+        k1.metric("Live flows scored", f"{t['flows']:,}", help="Every live flow the model has judged.")
         k2.metric("Alerts raised", f"{t['alerts']:,}",
                   f"{t['alerts'] / t['flows']:.1%} of flows" if t["flows"] else None, delta_color="off")
         k3.metric("Alerts that were real attacks", f"{t['tp'] / t['alerts']:.1%}" if t["alerts"] else "—",
-                  help="Precision: share of alerts whose ground-truth label is an attack.")
+                  help="Precision: share of alerts whose true label is an attack.")
         k4.metric("Real attacks caught", f"{t['tp'] / t['attacks']:.1%}" if t["attacks"] else "—",
-                  help="Recall: share of the real attacks among the scored flows that raised an alert.")
-        st.caption("Headline numbers: Delta gold_scored. Chart: every alert in the serving cache.")
+                  help="Recall: share of the real attacks that raised an alert.")
         st.subheader("Alerts per minute by predicted attack family")
         a["minute"] = pd.to_datetime(a["minute"])
-        st.plotly_chart(px.bar(a, x="minute", y="alerts", color="predicted_family", height=380,
+        st.plotly_chart(px.bar(a, x="minute", y="alerts", color="predicted_family", height=360,
                                labels={"minute": "", "alerts": "alerts"}), width="stretch")
-        reasons = q("SELECT alert_reason, COUNT(*) n FROM alerts GROUP BY 1")
-        if not reasons.empty:
-            st.subheader("Which model raised the alert")
-            st.caption("rf = RandomForest (known attack types) · anomaly = KMeans distance (unusual traffic) · "
-                       "rf+anomaly = both")
-            st.plotly_chart(px.pie(reasons, names="alert_reason", values="n", height=300, hole=0.5),
-                            width="stretch")
 
-# ── 3. Hosts ───────────────────────────────────────────────────────────────────
-with tab_hosts:
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Top alerting source hosts")
-        top = q("SELECT src_ip, src_zone, COUNT(*) alerts, COUNT(DISTINCT dst_port) dst_ports, "
-                "GROUP_CONCAT(DISTINCT predicted_family) families FROM alerts "
-                "GROUP BY src_ip, src_zone ORDER BY alerts DESC LIMIT 15")
-        if not top.empty:
-            st.dataframe(top, width="stretch", hide_index=True)
-        else:
-            st.info("No alerts yet.")
-    with c2:
-        st.subheader("Port-scan candidates")
-        st.caption(f"Hosts that contacted more than {cfg()['streaming']['port_scan_distinct_ports']} "
-                   "distinct destination ports within one 1-minute window.")
-        ps = q("SELECT window_start, split, src_ip, distinct_dst_ports, flows FROM port_scan_candidates "
-               "ORDER BY distinct_dst_ports DESC LIMIT 100")
-        if not ps.empty:
-            st.dataframe(ps, width="stretch", hide_index=True)
-        else:
-            st.info("None detected yet.")
-    hw_df = q("SELECT window_start, src_ip, flows, distinct_dst_ips, distinct_dst_ports, syn_ratio, attack_flows "
-              "FROM host_window_stats ORDER BY window_start DESC, flows DESC LIMIT 2000")
-    if not hw_df.empty:
-        st.subheader("Busiest hosts per 1-minute window")
-        st.caption("Each dot is one host in one minute. Top right = many flows to many ports (scan / flood).")
-        st.plotly_chart(px.scatter(hw_df, x="distinct_dst_ports", y="flows", color="attack_flows",
-                                   hover_data=["src_ip", "window_start"], log_x=True, log_y=True, height=380),
-                        width="stretch")
-
-# ── 4. Alert feed ──────────────────────────────────────────────────────────────
-with tab_feed:
-    fams = q("SELECT DISTINCT predicted_family FROM alerts")
-    f1, f2, f3 = st.columns(3)
-    pick = f1.multiselect("Predicted family", sorted(fams.predicted_family.dropna()) if not fams.empty else [])
-    ip = f2.text_input("Source IP contains")
-    minp = f3.slider("Min P(attack)", 0.0, 1.0, 0.0, 0.05)
-    sql = ("SELECT event_time, src_ip, dst_ip, dst_port, service, predicted_family, attack_prob, "
-           "anomaly_score, alert_reason, label_family AS ground_truth, model_version, flow_uid "
-           "FROM alerts WHERE attack_prob >= ?")
-    params: list = [minp]
-    if pick:
-        sql += f" AND predicted_family IN ({','.join('?' * len(pick))})"
-        params += pick
-    if ip:
-        sql += " AND src_ip LIKE ?"
-        params.append(f"%{ip}%")
-    feed = q(sql + " ORDER BY event_time DESC LIMIT 500", tuple(params))
-    if feed.empty:
-        st.info("No matching alerts.")
-    else:
+        st.subheader("Latest alerts")
+        fams = sorted(a.predicted_family.dropna().unique())
+        pick = st.multiselect("Predicted family", fams)
+        sql = ("SELECT event_time, src_ip, dst_ip, dst_port, service, predicted_family, attack_prob, "
+               "alert_reason, label_family AS ground_truth FROM alerts")
+        params: tuple = ()
+        if pick:
+            sql += f" WHERE predicted_family IN ({','.join('?' * len(pick))})"
+            params = tuple(pick)
+        feed = q(sql + " ORDER BY event_time DESC LIMIT 300", params)
         feed.insert(6, "correct?", (feed.ground_truth != NORMAL).map({True: "✅", False: "❌"}))
-        st.caption(f"{len(feed):,} most recent matching alerts · ✅ = ground truth is an attack")
-        st.dataframe(feed.style.format({"attack_prob": "{:.3f}", "anomaly_score": "{:.2f}"}),
-                     width="stretch", hide_index=True, height=520)
+        st.caption("✅ = the true label is an attack (the alert was right) · ❌ = it was normal traffic")
+        st.dataframe(feed.style.format({"attack_prob": "{:.3f}"}), width="stretch", hide_index=True, height=420)
 
-# ── 5. Lakehouse & model ───────────────────────────────────────────────────────
-with tab_lake:
-    st.subheader("Delta tables")
-    infos = [i for i in (delta_info(t) for t in
-             ["bronze_flows", "silver_flows", "silver_quarantine", "gold_attack_timeline",
-              "gold_host_profile", "gold_port_scan", "gold_scored", "gold_model_predictions"]) if i]
-    if infos:
-        st.dataframe(pd.DataFrame(infos), width="stretch", hide_index=True)
-        st.caption("version = Delta commits so far (each streaming micro-batch is one ACID commit) · "
-                   "many small files are what `make maintenance` (OPTIMIZE) compacts.")
-    else:
-        st.info("No Delta tables yet.")
-
-    tl = delta_table("gold_attack_timeline")
-    if not tl.empty:
-        st.subheader("Gold: attack timeline (1-minute tumbling windows, ground truth)")
-        split = st.radio("Split", sorted(tl.split.dropna().unique()), horizontal=True)
-        tls = tl[tl.split == split].sort_values("window_start")
-        st.plotly_chart(px.bar(tls, x="window_start", y="flows", color="label_family", height=380),
-                        width="stretch")
-
+# ── 3. Model & hosts: how good is the model, and who is attacking? ────────────
+with tab_model:
     st.subheader(f"Model v{version}" if version else "Model")
     if not version:
         st.info("No model registered yet (`make train`).")
     else:
-        held_out = metrics or meta.get("metrics", {})
-        sources = {"Held-out test split": held_out}
+        sources = {"Held-out test split": metrics or meta.get("metrics", {})}
         if metrics_live:
             sources["Live stream (never trained on)"] = metrics_live
-        src_name = st.radio("Metrics on", list(sources), horizontal=True)
-        mm = sources[src_name]
-        cols = st.columns(5)
+        mm = sources[st.radio("Metrics on", list(sources), horizontal=True)]
         helps = {
-            "macro_f1": "Average F1 over attack families, each family weighted equally (rare ones count as much "
-                        "as common ones).",
-            "rf_attack_prob_auc": "How well the RandomForest's P(attack) ranks attacks above normal traffic "
-                                  "(1.0 = perfect).",
-            "kmeans_anomaly_auc": "Same, for the unsupervised KMeans distance score.",
+            "macro_f1": "Average F1 over the 8 attack families, each counted equally.",
+            "rf_attack_prob_auc": "How well the RandomForest separates attacks from normal traffic (1.0 = perfect).",
+            "kmeans_anomaly_auc": "The same, for the KMeans distance score.",
             "alert_precision": "Share of alerts that were real attacks.",
             "alert_recall": "Share of real attacks that raised an alert.",
         }
-        for c, (lbl, key) in zip(cols, [("Macro-F1", "macro_f1"), ("RF AUC", "rf_attack_prob_auc"),
-                                        ("KMeans AUC", "kmeans_anomaly_auc"), ("Alert precision", "alert_precision"),
-                                        ("Alert recall", "alert_recall")]):
+        for c, (lbl, key) in zip(st.columns(5), [("Macro-F1", "macro_f1"), ("RF AUC", "rf_attack_prob_auc"),
+                                                 ("KMeans AUC", "kmeans_anomaly_auc"),
+                                                 ("Alert precision", "alert_precision"),
+                                                 ("Alert recall", "alert_recall")]):
             c.metric(lbl, f"{mm.get(key, float('nan')):.3f}", help=helps[key])
-        n_rows = mm.get("rows") or mm.get("test_rows")
-        st.caption((f"Evaluated on {n_rows:,} flows · " if n_rows else "")
-                   + f"trained on silver_flows@v{meta.get('silver_version')} · {meta.get('train_rows', 0):,} rows · "
-                   f"RF {meta.get('rf_params')} · anomaly threshold {meta.get('anomaly_threshold', 0):.3f}")
         pc = mm.get("per_class") or {}
         if pc:
             per = pd.DataFrame(pc).T.sort_values("support", ascending=False)
             per["support"] = per["support"].astype(int)
             st.dataframe(per.style.format({"precision": "{:.3f}", "recall": "{:.3f}", "f1": "{:.3f}",
                                            "support": "{:,}"}), width="stretch")
-        plots = os.path.join(registry.root(), f"v{version}", "plots")
-        if os.path.isdir(plots):
-            imgs = sorted(os.listdir(plots))
-            for c, img in zip(st.columns(max(len(imgs), 1)), imgs):
-                c.image(os.path.join(plots, img), caption=img, width="stretch")
+        st.caption(f"Trained on silver_flows@v{meta.get('silver_version')} · {meta.get('train_rows', 0):,} rows · "
+                   f"RF {meta.get('rf_params')} · anomaly threshold {meta.get('anomaly_threshold', 0):.2f}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Port-scan suspects")
+        st.caption(f"Hosts that touched more than {cfg()['streaming']['port_scan_distinct_ports']} "
+                   "different ports in one minute (counting in the gold layer, no ML).")
+        ps = q("SELECT src_ip, MAX(distinct_dst_ports) AS max_ports, COUNT(*) AS windows FROM port_scan_candidates "
+               "GROUP BY src_ip ORDER BY max_ports DESC LIMIT 20")
+        if not ps.empty:
+            st.dataframe(ps, width="stretch", hide_index=True)
         else:
-            st.caption("Run `make evaluate` / `make evaluate-live` (with the stream stopped) to generate plots.")
+            st.info("None detected yet.")
+    with c2:
+        st.subheader("Top alerting hosts")
+        top = q("SELECT src_ip, src_zone, COUNT(*) alerts, GROUP_CONCAT(DISTINCT predicted_family) families "
+                "FROM alerts GROUP BY src_ip, src_zone ORDER BY alerts DESC LIMIT 15")
+        if not top.empty:
+            st.dataframe(top, width="stretch", hide_index=True)
+        else:
+            st.info("No alerts yet.")
 
 st.caption(f"Rendered {datetime.now():%H:%M:%S} · SQLite {db_path()}")
 if auto:

@@ -80,3 +80,7 @@ spark-warehouse/
 # ─── Screenshots / Logs (not source code) ─────────────────────────────────────
 # Comment out if you want to commit these
 screenshots/
+
+# Symlinks to the shared data/venv of ../anomaly-detection-platform (files, so data/ alone does not match)
+data
+venv

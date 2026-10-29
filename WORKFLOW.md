@@ -109,7 +109,7 @@ picks up the new flows from Kafka and pushes them through the steps below.
 ### The 5 queries that `make stream` starts
 
 A **query** is one continuous job inside the Spark program. When `make stream` starts, it prints
-these 5 names, and you'll see the same names on the dashboard's **Live pipeline** tab:
+these 5 names, and you'll see the same names on the dashboard's **Pipeline** tab:
 
 | Query name | What it does | Why it's needed | Explained in |
 |---|---|---|---|
@@ -211,15 +211,13 @@ newer model version is trained, Spark switches to it automatically, with no rest
 
 ## Step 10: Dashboard (show it to people)
 
-**What happens:** `make dashboard` opens a web page (http://localhost:8501) with five tabs:
+**What happens:** `make dashboard` opens a web page (http://localhost:8501) with three tabs:
 
 | Tab | Shows |
 |---|---|
-| Live pipeline | how fast data is flowing, and whether anything is waiting in Kafka |
-| Threat timeline | alerts per minute, by attack type |
-| Hosts | the most suspicious computers, and port scanners |
-| Alert feed | each individual alert, marked ✅ if it really was an attack |
-| Lakehouse & model | the data tables, and how accurate the model is |
+| 📡 Pipeline | how fast data is flowing, and whether anything is waiting in Kafka |
+| 🚨 Alerts | how many attacks were found and how many were right, alerts per minute, and each alert marked ✅ if it really was an attack |
+| 🧠 Model & hosts | how accurate the model is, the port scanners, and the most suspicious computers |
 
 **Why it's needed:** numbers hidden in tables help nobody. The dashboard is where a security analyst
 would actually see and act on the attacks.
@@ -314,11 +312,11 @@ Either one is enough, so an **alert** is raised. It's tagged with the model vers
 ### 8. The dashboard shows it
 
 A few seconds later, in http://localhost:8501:
-- **Threat timeline:** the "Port Scanning" line jumps up at 14:32.
-- **Hosts:** `172.16.0.1` is at the top of the port-scan suspects.
-- **Alert feed:** a new row says `172.16.0.1 → 192.168.10.50:22 · Port Scanning · 97%` with a ✅,
-  because the real label really was PortScan, so the model was right.
-- **Live pipeline:** shows the batch being processed and the Kafka lag going back to 0.
+- **Pipeline:** shows the batch being processed and the Kafka lag going back to 0.
+- **Alerts:** the "Port Scanning" bar jumps up at 14:32, and a new row in the latest alerts says
+  `172.16.0.1 → 192.168.10.50:22 · Port Scanning · 0.97` with a ✅, because the real label really
+  was PortScan, so the model was right.
+- **Model & hosts:** `172.16.0.1` is at the top of the port-scan suspects.
 
 ### The whole journey at a glance
 

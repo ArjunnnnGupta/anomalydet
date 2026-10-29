@@ -13,10 +13,9 @@ Kafka is the ONLY way data enters the platform (Kappa architecture). This produc
   • optionally paces the replay against event time (--speedup) and re-bases the
     timestamps onto the wall clock so the live pass looks like traffic happening now
 
-Usage (from the project root, Kafka reachable at localhost:9092/9094/9096):
+Usage (from the project root, Kafka reachable at localhost:9092):
     python -m src.ingestion.replay_producer --split backfill                  # full speed
     python -m src.ingestion.replay_producer --split live --speedup 300        # paced + rebased
-    python -m src.ingestion.replay_producer --split live --inject-bad 50      # DLQ demo
 """
 
 from __future__ import annotations
@@ -162,8 +161,6 @@ def main():
                     help="stamp records with wall-clock replay time (auto: only for --split live)")
     ap.add_argument("--files", nargs="*", help="subset of CSV file names (default: all, in order)")
     ap.add_argument("--limit", type=int, default=0, help="stop after N messages (0 = no limit)")
-    ap.add_argument("--inject-bad", type=int, default=0, help="also send N malformed records")
-    ap.add_argument("--bad-only", action="store_true", help="only send the --inject-bad records, then exit")
     ap.add_argument("--benign-pct", type=int, default=None,
                     help="keep this %% of BENIGN rows, all attack rows (default: dataset.benign_pct)")
     ap.add_argument("--sample-pct", type=int, default=100,
@@ -175,7 +172,7 @@ def main():
     raw_dir = path(d["raw_dir"])
     files = args.files or d["files"]
     missing = [f for f in files if not os.path.exists(os.path.join(raw_dir, f))]
-    if missing and not args.bad_only:
+    if missing:
         print(f"\nERROR: missing CICIDS2017 CSVs in {raw_dir}:\n  " + "\n  ".join(missing))
         print("Download GeneratedLabelledFlows.zip (TrafficLabelling) from "
               "https://www.unb.ca/cic/datasets/ids-2017.html and unzip it there.")
@@ -190,14 +187,6 @@ def main():
     print(f"\n{'=' * 64}\nReplay producer → {tp}  @ {kafka_bootstrap()}")
     print(f"  split={args.split}  speedup={args.speedup or 'max'}  max_rate={args.max_rate or '∞'}  "
           f"rebase={rebase}  run_id={run_id}  benign kept={benign_pct}% (all attacks kept)  sample={args.sample_pct}%\n{'=' * 64}")
-
-    if args.inject_bad:
-        for v in bad_records(args.inject_bad):
-            produce(producer, stats, tp, b"bad-actor", v, None)
-        print(f"Injected {args.inject_bad} malformed records.")
-    if args.bad_only:
-        producer.flush(30)
-        return
 
     wall_start = time.time()
     virtual_s = 0.0      # event-time seconds elapsed (gaps capped)

@@ -35,14 +35,12 @@ def in_docker() -> bool:
 
 def kafka_bootstrap() -> str:
     """Internal listener inside the compose network, external one from the host."""
-    if os.environ.get("KAFKA_BOOTSTRAP"):
-        return os.environ["KAFKA_BOOTSTRAP"]
     k = cfg()["kafka"]
     return k["bootstrap_internal"] if in_docker() else k["bootstrap_external"]
 
 
 def replication_factor() -> int:
-    return int(os.environ.get("KAFKA_RF", cfg()["kafka"]["replication_factor"]))
+    return int(cfg()["kafka"]["replication_factor"])
 
 
 def topic(name: str) -> str:

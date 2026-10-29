@@ -59,23 +59,17 @@ to replay everything.
 
 ## 2. Cluster topology
 
-> **Default on the laptop: the lite profile** (`docker-compose.lite.yml`): 1 Kafka broker (RF=1),
-> Kafka UI, the Spark master and **1 worker** (2 cores, 3 GB). On an 8 GB Mac with Docker at 6 GB the
-> full cluster below kept running out of memory, so the demo runs lite. Everything else (topics,
-> partitions, the streaming app, Delta, MLlib) is identical. The full cluster is one flag away
-> (`LITE=0`) and is described here because it shows replication.
+One small cluster, sized for an 8 GB Mac with Docker at 6 GB (`docker/docker-compose.yml`):
 
 ```
 ┌──────────────────────────── Docker network ────────────────────────────┐
 │                                                                         │
-│  kafka-1 ◄──Raft──► kafka-2 ◄──Raft──► kafka-3    (combined broker +    │
-│  :9092                :9094               :9096    controller, KRaft)   │
-│     ▲ replication: every partition has 3 replicas, min.insync = 2       │
+│  kafka-1 :9092   (one KRaft broker = broker + controller, RF=1)         │
 │     │                                                                   │
 │  kafka-ui :8080                                                         │
 │                                                                         │
-│  spark-master :8081 ──┬── spark-worker-1 (2 cores, 1200m)               │
-│  (+ drivers, client   └── spark-worker-2 (2 cores, 1200m)               │
+│  spark-master :8081 ──── spark-worker-1 (2 cores, 2000m, container 3 GB)│
+│  (+ drivers, client                                                     │
 │   mode :4040/:4041)                                                     │
 │        all mount the project at /opt/app  (shared FS for Delta tables)  │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -84,21 +78,22 @@ to replay everything.
 
 | Service | Memory cap | Notes |
 |---|---|---|
-| 3 × Kafka | 512 MB (heap 320 MB) | internal listener `:19092`, host listeners 9092/9094/9096 |
+| Kafka | 512 MB (heap 320 MB) | internal listener `:19092`, host listener 9092 |
 | Kafka UI | 320 MB | kafbat/kafka-ui |
 | Spark master | 2.5 GB | also hosts the drivers (stream app 768 MB, jobs 1 GB) |
-| 2 × Spark worker | 1.8 GB | executors: 800 MB heap + 256 MB direct memory (RocksDB state capped at 128 MB) |
+| Spark worker | 3 GB | executors: 800 MB heap + 256 MB direct memory (RocksDB state capped at 128 MB) |
 
-The streaming app runs as **two 1-core executors, one per worker** (`spark.cores.max=2`,
-`executor.cores=1`), under FAIR scheduling. An earlier layout with one 2-core executor put all the
-work on worker-1, which was OOM-killed while worker-2 sat idle.
+The streaming app runs as **two 1-core executors** (`spark.cores.max=2`, `executor.cores=1`)
+under FAIR scheduling. An earlier layout with one 2-core executor ran out of memory.
 
 **Batch jobs (train, evaluate, maintenance) run only while the stream is stopped.** The drivers
 live in the master container, and two at once (stream + evaluate) got it OOM-killed on 6 GB.
 The Makefile refuses to start a batch job while the stream runs. On a larger cluster the two
 can run side by side, and the scorer then swaps a newly trained model in mid-stream: it
 re-reads the registry's `latest.json` on every micro-batch (covered by the test suite).
-`docker-compose.lite.yml` (1 broker, 1 worker) is the fallback for machines that swap.
+
+On a real multi-machine cluster, the same code would run with more brokers and workers; only the
+Docker setup changes.
 
 ---
 
@@ -114,9 +109,8 @@ re-reads the registry's `latest.json` on every micro-batch (covered by the test 
 - **Partitioning and keys:** keying by Source IP sends every flow of a host to one partition.
   That keeps each host's events in order and spreads load across 12 partitions, which caps
   consumer parallelism at 12.
-- **Replication (full cluster, `LITE=0`):** RF=3, `min.insync.replicas=2`, and producer `acks=all`. A write
-  is acknowledged once 2 of the 3 replicas have it, so one broker can fail with no data loss and no
-  downtime. The default lite profile has one broker (RF=1): partitioning still applies, replication doesn't.
+- **Replication:** one broker, so replication factor 1. The producer still uses `acks=all`. With more
+  brokers, a higher replication factor would let one broker fail without losing data.
 - **Idempotent producer:** `enable.idempotence=true`, so librdkafka retries never create duplicates.
 - **Throughput tuning:** `linger.ms=20`, `batch.size=256KB`, `compression.type=lz4`.
   When the local queue is full, the producer calls `poll()` until it drains, which gives natural backpressure.
@@ -188,8 +182,8 @@ gold_attack_timeline   gold_host_profile, gold_port_scan     │   → SQLite al
 - **Host windows are tumbling (1 min), not sliding.** The window length and slide are config
   values; a 5-minute window sliding every minute puts each flow in 5 windows, which was too much
   work for an 8 GB laptop. Setting `host_slide` smaller than `host_window` turns sliding back on.
-- **Catch-up mode:** `--available-now` runs each stage with `Trigger.AvailableNow` in upstream →
-  downstream order, then exits. The tests use it, and it's handy for reprocessing.
+- **Tests** run each stage with `Trigger.AvailableNow` (drain what's there, then stop), via the
+  `STREAM_AVAILABLE_NOW` switch in `config.trigger()`.
 
 ---
 
@@ -237,8 +231,6 @@ silver_flows @ version V (time travel pins the training snapshot)
 train ─► broadcast-join class weights √(N / (k·n_c))
       ─► Feature PipelineModel: Imputer(median) → VectorAssembler → StandardScaler
       ─► StringIndexer ─► RandomForestClassifier(weightCol, 50 trees, depth 10) ─► IndexToString
-      │                    (optional: make train ARGS=--cv tunes numTrees × maxDepth with a
-      │                     2-fold CrossValidator, parallelism 2; slower, off by default)
       └─ benign rows only ─► KMeans(k=8) ─► threshold = approxQuantile(distance, 0.995)
 test  ─► macro-F1, per-class P/R/F1 (groupBy confusion matrix), ROC-AUC of P(attack) and of
          the KMeans distance, alert precision/recall
@@ -272,12 +264,10 @@ shared by training (to set the threshold) and by streaming (to score).
   commits bronze's processed offsets to the Kafka consumer group `spark-bronze-ingest`. Spark
   normally keeps offsets only in its checkpoint, so without that commit, consumer lag would be
   invisible to Kafka UI.
-- **Dashboard** (`src/dashboard/app.py`, no Spark) has 5 tabs:
-  - live pipeline: throughput, batch latency, per-partition Kafka lag
-  - threat timeline
-  - hosts: top talkers, port scans
-  - alert feed
-  - lakehouse & model: Delta versions read via delta-rs, metrics, plots
+- **Dashboard** (`src/dashboard/app.py`, no Spark) has 3 tabs:
+  - pipeline: stream status, throughput per query, per-partition Kafka lag
+  - alerts: headline numbers from Delta `gold_scored` (via delta-rs), alerts per minute, latest alerts with ✅/❌
+  - model & hosts: model metrics, port-scan suspects, top alerting hosts
 - **Spark UIs:** the master on :8081, the streaming tab on :4040, and event logs in `data/spark-events`.
 
 ---
@@ -286,7 +276,7 @@ shared by training (to set the threshold) and by streaming (to score).
 
 | Hop | Guarantee | Mechanism |
 |---|---|---|
-| producer → Kafka | exactly-once per partition | idempotent producer, `acks=all`, RF=3, min.ISR=2 |
+| producer → Kafka | exactly-once per partition | idempotent producer, `acks=all` |
 | Kafka → bronze | exactly-once | Kafka offsets in the checkpoint + Delta transactional sink |
 | bronze → silver | exactly-once | Delta source versions in the checkpoint + Delta idempotent write (`txnAppId`/`txnVersion`) |
 | silver → quarantine / gold_scored | exactly-once | Delta idempotent writes (`txnAppId` = query, `txnVersion` = batch id) |
@@ -308,7 +298,6 @@ same thing by replaying micro-batches.
 | **Velocity:** continuous micro-batches, paced event-time replay | `stream_app.py`, `replay_producer.py --speedup` |
 | **Variety / veracity:** raw strings, mixed timestamp formats, Inf/NaN, bad records | `silver.parse`, DQ rules, quarantine + DLQ |
 | Distributed log, partitions, message keys | `create_topics.py`, producer `key=source_ip` |
-| Replication, ISR, broker fault tolerance (full cluster, `LITE=0`) | `docker-compose.yml` (RF=3, min.ISR=2), `create_topics --describe` |
 | Idempotent producer, acks, batching, compression | `replay_producer.make_producer` |
 | Consumer offsets, replay, consumer lag | bronze checkpoint, `metrics_listener._commit_offsets`, dashboard lag chart |
 | Backpressure | `maxOffsetsPerTrigger` (bronze), producer queue `poll()` |
@@ -330,7 +319,6 @@ same thing by replaying micro-batches.
 | Adaptive Query Execution, shuffle partitions | `spark.py` |
 | Spark standalone cluster, executors, FAIR scheduling, cores.max | `docker-compose.yml`, `spark.py` |
 | MLlib Pipelines, distributed training | `model_utils.feature_pipeline`, `train_pipeline.py` |
-| Distributed hyperparameter tuning (optional) | `make train ARGS=--cv` → `CrossValidator(parallelism=2)` |
 | Class imbalance handling at scale | broadcast class weights, `weightCol` |
 | Stratified sampling | `sampleBy` + `left_anti` |
 | Vectorised (Arrow) pandas UDFs | `model_utils.add_anomaly_score` |

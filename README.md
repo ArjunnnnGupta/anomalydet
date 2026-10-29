@@ -1,4 +1,10 @@
-# Kappa Network-Flow Anomaly Detection Platform
+# Network Anomaly Platform (simple version)
+
+> This folder is the **simplified** version of `../anomaly-detection-platform`: one cluster size,
+> fewer commands and a 3-tab dashboard. The pipeline code is the same. `data/` and `venv/` are
+> symlinks to the original folder, so both share the same dataset, lake and trained model.
+> Both folders also use the same Docker containers, so run only one at a time: `make cluster-down`
+> in one folder before `make cluster-up` in the other.
 
 > **Big Data Analytics (BCSE402L), VIT Chennai.** A streaming-first big data pipeline over the
 > CICIDS2017 intrusion-detection dataset (2.83M labelled network flows; the demo replays
@@ -11,7 +17,7 @@ live traffic in real time. The scorer checks the model registry on every micro-b
 a newly registered version without a code change or redeploy.
 
 ```
- CICIDS2017 CSVs ──► replay producer ──► Kafka (KRaft · 12 partitions; 1 broker by default, 3 with LITE=0)
+ CICIDS2017 CSVs ──► replay producer ──► Kafka (KRaft · 1 broker · 12 partitions)
                      (idempotent, lz4,          │
                       keyed by Source IP)       ▼
             ┌──────────── Spark Structured Streaming app (5 queries) ────────────┐
@@ -39,9 +45,9 @@ Build progress is logged in [CHECKPOINT.md](CHECKPOINT.md).
 
 | Component | Runs in | UI |
 |---|---|---|
-| Kafka in KRaft mode, no ZooKeeper (1 broker by default; 3 brokers, RF=3 with `LITE=0`) | Docker | — |
+| Kafka in KRaft mode, no ZooKeeper (1 broker) | Docker | — |
 | Kafka UI (topics, partitions, ISR, consumer lag) | Docker | http://localhost:8080 |
-| Spark standalone: 1 master + 1 worker (2 workers with `LITE=0`) | Docker | http://localhost:8081 |
+| Spark standalone: 1 master + 1 worker | Docker | http://localhost:8081 |
 | Streaming app (driver, client mode) | `spark-master` container | http://localhost:4040 |
 | Training / evaluation / maintenance jobs (run with the stream stopped) | `spark-master` container | http://localhost:4040 |
 | Replay producer, topic admin, dashboard, tests | host (`./venv`) | http://localhost:8501 |
@@ -80,9 +86,7 @@ make build          # Spark 3.5.3 image with Kafka + Delta jars baked in
 make cluster-up     # 1 Kafka broker + Kafka UI + Spark master + 1 worker
 make topics         # create topics, print leader/replicas/ISR per partition
 ```
-**Default is the lite profile** (1 broker, RF=1, 1 worker): on an 8 GB Mac the 3-broker / 2-worker
-cluster kept running out of memory. The full cluster is still there: add `LITE=0` to every target
-(e.g. `make cluster-up LITE=0`) to get 3 brokers with replication (RF=3, min.ISR=2) and 2 workers.
+The cluster is deliberately small (1 Kafka broker, 1 Spark worker) so it fits on an 8 GB Mac.
 
 ### 4. Run the pipeline (Kappa: two passes through Kafka)
 ```bash
@@ -106,12 +110,10 @@ Docker memory there is no room for two Spark drivers. Stop the stream (Ctrl+C), 
 
 ### 5. More to try
 ```bash
-make inject-bad            # 50 malformed records → silver_quarantine + Kafka flows.dlq
 make train                 # (stream stopped) register v2 → the next `make stream` serves v2
 make evaluate              # metrics + plots on the held-out test split
 make evaluate-live         # metrics on what the live stream actually scored
 make maintenance           # OPTIMIZE / ZORDER, DESCRIBE HISTORY, time travel, schema evolution, VACUUM
-# (full cluster only, LITE=0) docker compose -f docker/docker-compose.yml stop kafka-2   # broker failure: min.ISR=2 keeps it running
 ```
 Stop the streaming app with Ctrl+C and start it again: every query resumes from its checkpoint,
 and the idempotent sinks keep the tables free of duplicates.
@@ -124,13 +126,13 @@ and the idempotent sinks keep the tables free of duplicates.
 |---|---|
 | `setup` / `test` | create the host venv / run the pytest suite (local Spark, no Docker needed) |
 | `build`, `cluster-up`, `cluster-down`, `cluster-ps`, `logs` | cluster lifecycle |
-| `topics`, `topics-describe` | create topics from `conf/pipeline.yaml`, show partition layout |
-| `stream`, `stream-bg`, `stream-logs` | streaming app in the foreground / background / tail its log |
-| `stream-catchup` | drain everything available stage by stage, then exit (`availableNow`) |
-| `backfill`, `live` (`SPEEDUP=…`), `inject-bad` (`INJECT_BAD=…`) | Kafka replay producer |
+| `topics` | create topics from `conf/pipeline.yaml` and show the partition layout |
+| `stream` | the always-on streaming app (all 5 queries) |
+| `backfill`, `live` (`LIVE_PCT=…`, `SPEEDUP=…`) | Kafka replay producer |
 | `wait` | block until the stream has caught up |
-| `train` (`ARGS=--cv` for CrossValidator tuning), `evaluate`, `evaluate-live`, `maintenance` | Spark batch jobs on the lake |
-| `dashboard` | Streamlit dashboard |
+| `train`, `evaluate`, `evaluate-live`, `maintenance` | Spark batch jobs on the lake (stream stopped) |
+| `dashboard` | Streamlit dashboard, 3 tabs: Pipeline · Alerts · Model & hosts |
+| `demo-reset` | fresh demo: clear previous live results and empty Kafka (keeps the model and backfill data) |
 | `reset` | wipe the lake, checkpoints, registry and SQLite, and recreate the topics (asks first) |
 
 ---
@@ -139,7 +141,7 @@ and the idempotent sinks keep the tables free of duplicates.
 
 ```
 conf/pipeline.yaml        single source of truth: topics, partitions, paths, windows, thresholds, ML params
-docker/                   docker-compose.yml (full), docker-compose.lite.yml, spark/Dockerfile
+docker/                   docker-compose.yml (the cluster), spark/Dockerfile
 src/common/               config, SparkSession builder, dataset schema, dimension tables, Delta helpers
 src/ingestion/            create_topics.py, replay_producer.py, wait_caught_up.py
 src/streaming/            stream_app.py + bronze / silver / gold / scoring / metrics_listener
@@ -154,7 +156,7 @@ data/                     (generated) raw/, lake/, checkpoints/, models/registry
 ## Tests
 
 ```bash
-make test     # 16 tests, ~3 min
+make test     # 18 tests, ~3 min
 ```
 The suite runs the real streaming queries in `availableNow` mode against a temporary lake. It
 covers bronze → silver (DQ quarantine, idempotent replay) → gold windows and port-scan detection →
@@ -164,7 +166,7 @@ and the cluster itself are exercised by the steps in Quick start.
 
 ## Troubleshooting
 
-- **The Mac swaps or containers get OOM-killed.** Stay on the default lite profile, keep live replays small (`LIVE_PCT`), and use `make stream-catchup` (one stage at a time) for big backlogs.
+- **The Mac swaps or containers get OOM-killed.** Keep live replays small (`make live LIVE_PCT=5`) and don't run two Spark jobs at once.
 - **`make train` says the streaming app is running.** That's deliberate: stop the stream (Ctrl+C), train or evaluate, then `make stream` again. With 6 GB of Docker memory, two Spark drivers at once got the driver container OOM-killed.
-- **`make wait` never finishes.** Check `make stream-logs`. The listener only records progress while the streaming app is running.
+- **`make wait` never finishes.** Check the `make stream` terminal for errors. Progress is only recorded while the streaming app is running.
 - **Disk fills up.** Kafka retention is capped per partition in `pipeline.yaml`. `make maintenance` VACUUMs Delta. `make reset` wipes everything.

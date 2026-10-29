@@ -9,18 +9,16 @@ Input : Delta silver_flows (split = 'backfill'), pinned to one table version
   1. stratified train/test split per attack family (sampleBy + left_anti join)
   2. class weights √(N / (k·n_class)), broadcast-joined, against the 400:1 imbalance
   3. feature PipelineModel  : Imputer → VectorAssembler → StandardScaler
-  4. supervised             : RandomForest (first grid point by default; --cv runs a
-                              distributed CrossValidator over the grid, slower)
+  4. supervised             : RandomForest (numTrees / maxDepth from pipeline.yaml)
   5. unsupervised           : KMeans on benign traffic only; anomaly threshold is the
                               99.5th percentile of benign centroid distances (approxQuantile)
   6. held-out evaluation    : macro-F1, per-class P/R, ROC-AUC of both scores
   7. register a new version : data/models/registry/vN  →  the streaming scorer hot-reloads it
   8. test predictions       → Delta gold_model_predictions
 
-Run inside the cluster:  make train            (or: make train ARGS=--cv)
+Run inside the cluster:  make train
 """
 
-import argparse
 import time
 from datetime import datetime, timezone
 
@@ -32,7 +30,6 @@ from pyspark.ml.classification import RandomForestClassifier
 from pyspark.ml.clustering import KMeans
 from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
 from pyspark.ml.feature import IndexToString, StringIndexer
-from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
@@ -62,7 +59,7 @@ def per_class_report(pred: DataFrame, label: str, predicted: str) -> dict:
             "macro_f1": sum(r["f1"] for r in report.values()) / max(len(report), 1)}
 
 
-def train(spark, use_cv: bool = False) -> int:
+def train(spark) -> int:
     """Train both models on silver's backfill split, register them, return the new version."""
     m = cfg()["ml"]
     label, normal, seed = m["label_col"], m["normal_label"], m["seed"]
@@ -99,27 +96,12 @@ def train(spark, use_cv: bool = False) -> int:
     labels = list(indexer.labels)
     train_i = indexer.transform(train_f)
 
-    # ── 4. RandomForest + CrossValidator ──────────────────────────────────────────
+    # ── 4. RandomForest ─────────────────────────────────────────────────────────────
     rf_cfg = m["rf"]
     rf = RandomForestClassifier(featuresCol=model_utils.FEATURES, labelCol="label_idx", weightCol="weight",
+                                numTrees=rf_cfg["num_trees"], maxDepth=rf_cfg["max_depth"],
                                 maxBins=rf_cfg["max_bins"], subsamplingRate=0.7, seed=seed)
-    grid = (ParamGridBuilder().addGrid(rf.numTrees, rf_cfg["num_trees"])
-            .addGrid(rf.maxDepth, rf_cfg["max_depth"]).build())
-    f1_eval = MulticlassClassificationEvaluator(labelCol="label_idx", predictionCol="prediction", metricName="f1")
-    cv_summary = None
-    if not use_cv:
-        best_rf = rf.copy(grid[0]).fit(train_i)
-    else:
-        print(f"\nCrossValidator: {len(grid)} param sets × {rf_cfg['cv_folds']} folds "
-              f"(parallelism={rf_cfg['cv_parallelism']}) ...")
-        cv = CrossValidator(estimator=rf, estimatorParamMaps=grid, evaluator=f1_eval,
-                            numFolds=rf_cfg["cv_folds"], parallelism=rf_cfg["cv_parallelism"], seed=seed)
-        cv_model = cv.fit(train_i)
-        best_rf = cv_model.bestModel
-        cv_summary = [{"params": {p.name: v for p, v in pm.items()}, "f1": f}
-                      for pm, f in zip(grid, cv_model.avgMetrics)]
-        for row in cv_summary:
-            print(f"  {row['params']}  →  F1 {row['f1']:.4f}")
+    best_rf = rf.fit(train_i)
     rf_model = PipelineModel(stages=[
         best_rf, IndexToString(inputCol="prediction", outputCol="predicted_family", labels=labels)])
 
@@ -144,7 +126,6 @@ def train(spark, use_cv: bool = False) -> int:
         "anomaly_threshold": threshold,
         "alert_prob_threshold": m["alert_prob_threshold"],
         "rf_params": {"numTrees": best_rf.getNumTrees, "maxDepth": best_rf.getOrDefault("maxDepth")},
-        "cv": cv_summary,
         "feature_importances": sorted(
             zip(FEATURE_COLS, best_rf.featureImportances.toArray().tolist()), key=lambda x: -x[1])[:20],
     }
@@ -197,11 +178,8 @@ def train(spark, use_cv: bool = False) -> int:
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cv", action="store_true", help="tune with CrossValidator over the grid (slower)")
-    args = ap.parse_args()
     spark = get_spark("mllib-train")
-    train(spark, use_cv=args.cv)
+    train(spark)
     spark.stop()
 
 

@@ -75,7 +75,6 @@ Each entry covers **what** it does, **where** it is, **why** we need it, and the
   - **Re-stamping:** live flows get the current time as their event time, so the demo looks like
     traffic happening now.
   - **Demo sample:** `make live` sends only a fixed 15% sample of the live split (`LIVE_PCT`).
-  - **Bad records:** `make inject-bad` sends deliberately broken messages to show data-quality handling.
 - **Big data concepts:**
   - **Message keys:** each flow is keyed by its source IP, so all of one host's flows go to the same
     partition, in order.
@@ -101,9 +100,8 @@ Each entry covers **what** it does, **where** it is, **why** we need it, and the
 - **Big data concepts:**
   - **Partitions:** the unit of parallelism. Up to 12 tasks can read `flows.raw` at once.
   - **Consumer offsets and lag:** Kafka UI shows how far behind the reader is.
-  - **Replication:** in the full cluster (`LITE=0`), 3 brokers keep 3 copies of every partition with
-    `min.insync.replicas=2`, so one broker can fail without losing data. The demo uses one broker to
-    fit in 8 GB.
+  - **Replication:** we run one broker (replication factor 1) to fit in 8 GB. On a real cluster,
+    several brokers would each keep a copy of every partition, so one could fail without losing data.
   - **KRaft:** Kafka runs without ZooKeeper.
 
 ### 3.4 The streaming application: one app, five queries
@@ -179,7 +177,7 @@ Each entry covers **what** it does, **where** it is, **why** we need it, and the
 - **Where:** `src/streaming/metrics_listener.py` → SQLite `stream_metrics`.
 - **What:** after every micro-batch, records rows processed, rows per second, batch duration and
   watermark. It also reports Spark's Kafka position back to Kafka, so Kafka UI can show the lag.
-- **Why:** this feeds the dashboard's Live pipeline tab, which is how you see the system working.
+- **Why:** this feeds the dashboard's Pipeline tab, which is how you see the system working.
 
 ### 3.5 Delta Lake: the lakehouse
 - **What:** a table format on top of Parquet files that adds database guarantees.
@@ -235,11 +233,9 @@ Each entry covers **what** it does, **where** it is, **why** we need it, and the
 
   | Tab | What it shows | Where the data comes from |
   |---|---|---|
-  | Live pipeline | rows/s per query, batch times, Kafka lag, stream status | SQLite `stream_metrics`, Kafka, Spark master |
-  | Threat timeline | alerts per minute by family, precision and recall | SQLite `alerts` + Delta `gold_scored` |
-  | Hosts | top attacking IPs, port-scan candidates | SQLite |
-  | Alert feed | individual alerts, ✅/❌ against ground truth | SQLite `alerts` |
-  | Lakehouse & model | Delta table versions, gold timeline, model metrics and plots | Delta (read with delta-rs) + model registry |
+  | 📡 Pipeline | stream status, rows/s per query, Kafka lag | SQLite `stream_metrics`, Kafka, Spark master |
+  | 🚨 Alerts | the 4 headline numbers, alerts per minute, the latest alerts with ✅/❌ | Delta `gold_scored` + SQLite `alerts` |
+  | 🧠 Model & hosts | model accuracy, port-scan suspects, top attacking IPs | model registry + SQLite |
 
 - **Why it doesn't need Spark:** it reads Delta tables directly with the lightweight `deltalake`
   library, so the dashboard stays fast and uses almost no memory.
@@ -252,84 +248,54 @@ The page refreshes itself every few seconds, so the numbers move while the demo 
 
 | Item | What it means |
 |---|---|
-| **Kafka (RF=1) → Spark … → real-time alerts** | The whole pipeline in one line. **RF=1** = replication factor 1: there's one Kafka broker because we use the small "lite" cluster (it would be 3 on the full cluster). |
+| **Kafka → Spark … → real-time alerts** | The whole pipeline in one line. |
 | **Auto-refresh / Refresh every (s)** | How often the page re-reads the data (default 5 seconds). |
 | **Streaming app: 🟢 running / 🔴 stopped** | Whether `make stream` is running. The dashboard asks the Spark master. If it's stopped, the numbers shown are from the last run. |
-| **Serving model: v1** | Which trained model version is currently judging live traffic. |
-| **Cluster UIs** | Links to Kafka UI (topics, partitions, lag), the Spark master (workers, apps) and the running Spark app (jobs, streaming queries). |
-| **Rendered … · SQLite …** (bottom) | When the page last refreshed, and which database file it reads. |
+| **Serving model: v1** | Which trained model version is judging live traffic. |
+| **Cluster UIs** | Links to Kafka UI (topics, partitions, lag), the Spark master and the running Spark app. |
 
-**Tab 1: 📡 Live pipeline (is the pipeline healthy and keeping up?)**
+**Tab 1: 📡 Pipeline (is data flowing, and is the stream keeping up?)**
 
 | Item | What it means |
 |---|---|
 | **Query cards** (e.g. `q1_bronze: 23 rows/s`, "batch 3 · 51 s ago") | One card per streaming query: how many rows per second its **last** micro-batch processed, which batch number that was, and how long ago it finished. A card appears only after that query finishes its first batch, so `q3b_gold_hosts` and `q4_scoring` (the slowest) show up last. |
-| **Kafka consumer lag (flows.raw)**, total + bar per partition | **Lag = messages waiting in Kafka that Spark hasn't read yet.** One bar for each of the 12 partitions. Lag goes up while the producer sends faster than Spark reads; Kafka safely holds them, and nothing is lost. **Lag 0 means bronze has read everything.** It doesn't mean silver, gold and scoring have finished; give them another minute or two. |
+| **Kafka consumer lag (flows.raw)**, total + bar per partition | **Lag = messages waiting in Kafka that Spark hasn't read yet.** One bar for each of the 12 partitions. Lag goes up while the producer sends faster than Spark reads; Kafka holds the messages safely, so nothing is lost. **Lag 0 means bronze has read everything.** Give silver, gold and scoring another minute or two after that. |
 | **Throughput per query** (line chart) | Rows per second for each query over time. Each dot is one micro-batch. Spikes are normal: a batch that picked up a big chunk of data. |
-| **Micro-batch duration** (line chart) | How long each batch took, in milliseconds. 30–140 seconds is normal on this laptop: 5 queries share 2 CPU cores. |
-| **Query state** (table) | The latest batch of each query: `batch_id` (batch number), `num_input_rows` (rows in that batch), `processed_rps` (rows per second), `batch_duration_ms` (time taken), `watermark` and `state_rows` (both explained below). |
-| `watermark` | Only the gold queries have one. It's the cut-off time: "events older than this are too late to count". It moves forward as newer data arrives. Bronze, silver and scoring show `None` because they don't use time windows. |
-| `state_rows` | How many 1-minute windows gold is still keeping open in memory, waiting for late data before closing them. |
-| **Pipeline events** | A log of what happened: queries starting, "loaded model v1 (hot reload)", "demo reset". |
-| "Charts show the last 30 minutes" | Older batches are hidden from the charts to keep them readable. |
 
-**Tab 2: 🚨 Threat timeline (what attacks are happening?)**
+**Tab 2: 🚨 Alerts (what was detected, and was it right?)**
 
 | Item | What it means |
 |---|---|
 | **Live flows scored** | How many live flows the model has judged so far. |
-| **Alerts raised** (and "% of flows") | How many of those flows the model flagged as attacks. The share is high (about 50%) because the demo data keeps every attack but only 20% of normal traffic. |
-| **Alerts that were real attacks** | **Precision**: of all alerts, the share that really were attacks (we know because every flow carries its true label). About 99% means very few false alarms. |
+| **Alerts raised** (and "% of flows") | How many of those flows the model flagged as attacks. The share is high (about 50%) because the demo keeps every attack but only 20% of normal traffic. |
+| **Alerts that were real attacks** | **Precision**: of all alerts, the share that really were attacks (every flow carries its true label, so we can check). About 99% means very few false alarms. |
 | **Real attacks caught** | **Recall**: of all real attacks, the share that raised an alert. About 99% means very few attacks missed. |
 | **Alerts per minute by predicted attack family** | A bar chart over time; colours = the attack type the model predicted (DoS, Brute Force, Port Scanning…). You can see attacks start and stop. |
-| **Which model raised the alert** (donut) | `rf` = the RandomForest recognised a known attack type; `anomaly` = KMeans found the traffic unusual compared with normal; `rf+anomaly` = both. Most alerts come from the RandomForest, and KMeans is the safety net. |
-| "No alerts yet" | Scoring hasn't finished its first batch yet (it takes 1–2 minutes after `make live` starts), or no live data has been sent. |
+| **Latest alerts** (table + family filter) | The newest alerts, one per row: when, who → whom, which port/service, the predicted type, `attack_prob` (the model's confidence, 0 to 1), `alert_reason` (`rf` = RandomForest recognised a known attack, `anomaly` = KMeans found it unusual, `rf+anomaly` = both) and `ground_truth` (the real label). |
+| **correct?** ✅ / ❌ | ✅ = the true label is an attack, so the alert was right. ❌ = it was normal traffic (a false alarm). |
+| "No alerts yet" | Scoring hasn't finished its first batch (it takes 1–2 minutes after `make live` starts), or no live data has been sent. |
 
-**Tab 3: 🖥️ Hosts (which computers are attacking?)**
-
-| Item | What it means |
-|---|---|
-| **Top alerting source hosts** | The 15 IPs with the most alerts. `src_zone` = internal / attacker network / external; `dst_ports` = how many different ports they targeted; `families` = the attack types predicted for them. |
-| **Port-scan candidates** | IPs that touched **more than 50 different ports in one minute**, the classic sign of a port scan. This comes from counting in the gold layer, **not** from the ML model. `172.16.0.1` (the attacker's address in the dataset) shows up here. |
-| **Busiest hosts per 1-minute window** (scatter) | Each dot = one computer in one minute. Right = touched many ports, up = made many connections, colour = how many of its flows were truly attacks. Dots in the **top right** are scanners or floods; normal machines sit bottom left. |
-
-**Tab 4: 📜 Alert feed (each alert, one by one)**
+**Tab 3: 🧠 Model & hosts (how good is the model, and who is attacking?)**
 
 | Item | What it means |
 |---|---|
-| **Filters** (predicted family, source IP, min P(attack)) | Narrow the list, e.g. only "Port Scanning", or only alerts the model was more than 90% sure about. |
-| `event_time`, `src_ip`, `dst_ip`, `dst_port`, `service` | When the flow happened, who talked to whom, on which port (and its service name, e.g. 22 = SSH). |
-| `predicted_family` | The attack type the model thinks it is. |
-| **correct?** ✅ / ❌ | ✅ = the true label is an attack, so the alert was right. ❌ = it was actually normal traffic (a false alarm). |
-| `attack_prob` | The RandomForest's confidence that it's an attack (0 to 1). |
-| `anomaly_score` | How far the flow is from normal traffic (KMeans distance). Above about 26.8 counts as unusual. |
-| `alert_reason` | Which model fired: `rf`, `anomaly` or `rf+anomaly`. |
-| `ground_truth` | The real label from the dataset, used only to check the model, never to make the decision. |
-| `model_version`, `flow_uid` | Which model judged it, and the flow's unique fingerprint. |
-
-**Tab 5: 🗄️ Lakehouse & model (the data tables and how good the model is)**
-
-| Item | What it means |
-|---|---|
-| **Delta tables** | One row per table in the lakehouse. `version` = how many times it has been written (each micro-batch is one safe "all-or-nothing" commit); `files` = the number of data files (lots of small files is what `make maintenance` compacts); `partitions` = how the table is split into folders; `last_op` = the last operation (WRITE, MERGE, OPTIMIZE…). |
-| **Gold: attack timeline** + **Split** buttons | Flows per minute by **true** attack family, straight from the gold Delta table. Switch between `backfill` (the 2017 history) and `live` (the demo traffic). |
-| **Model v1**, **Metrics on** buttons | Switch between **Held-out test split** (20% of the history that training never saw) and **Live stream** (the demo flows, also never seen in training). |
+| **Metrics on: Held-out test split / Live stream** | Switch between the 20% of history that training never saw, and the demo flows (also never seen in training). |
 | **Macro-F1** | The average score across all 8 attack types, each counted equally, so rare types (Bots, Infiltration) pull it down. 0.907 on the test split. |
-| **RF AUC / KMeans AUC** | How well each model's score separates attacks from normal traffic (1.0 = perfect, 0.5 = guessing). RF ≈ 0.9997, KMeans ≈ 0.71: KMeans is weaker alone, which is why it's only the backup. |
-| **Alert precision / Alert recall** | The same as in the Threat timeline: about 99% of alerts were real, and about 99% of attacks were caught. |
-| **The line under the metrics** | Details: how many flows it was tested on, the silver version it was trained on (time travel, v9), the number of training rows, the RandomForest settings and the anomaly threshold. |
+| **RF AUC / KMeans AUC** | How well each model's score separates attacks from normal traffic (1.0 = perfect, 0.5 = guessing). RF ≈ 1.0, KMeans ≈ 0.71: KMeans is weaker alone, which is why it's only the backup. |
+| **Alert precision / Alert recall** | The same as on the Alerts tab: about 99% of alerts were real, and about 99% of attacks were caught. |
 | **Per-family table** | Precision, recall, F1 and `support` (how many test flows) for each attack type. Big families score about 0.99; tiny ones score lower because there are few examples. |
-| **Plots** | The confusion matrix (what was predicted vs what was true), the feature importance (which flow features the RandomForest relies on most, e.g. destination port), and the anomaly-score distribution (normal vs attack, with the threshold line). |
+| **Line under the table** | The silver version the model was trained on (time travel, v9), the number of training rows, the RandomForest settings and the anomaly threshold. |
+| **Port-scan suspects** | IPs that touched **more than 50 different ports in one minute**, the classic sign of a port scan. `max_ports` = the most ports in a single minute, `windows` = in how many minutes. This comes from counting in the gold layer, **not** from the ML model. `172.16.0.1` (the attacker in the dataset) is at the top. |
+| **Top alerting hosts** | The 15 IPs with the most alerts, their zone (internal / attacker network / external) and the attack types predicted for them. |
 
 **Three things to point at during the demo**
-1. **Live pipeline:** Kafka lag goes up while `make live` sends, then falls back to 0. Kafka buffers, and Spark catches up.
-2. **Threat timeline:** the alert bars appear minute by minute, with about 99% precision and recall against the true labels.
-3. **Hosts:** `172.16.0.1` is flagged as a port scanner by simple counting in gold, without any ML.
+1. **Pipeline:** Kafka lag goes up while `make live` sends, then falls back to 0. Kafka buffers, and Spark catches up.
+2. **Alerts:** the alert bars appear minute by minute, with about 99% precision and recall against the true labels.
+3. **Model & hosts:** `172.16.0.1` is flagged as a port scanner by simple counting in gold, without any ML.
 
 ### 3.9 Cluster and infrastructure (Docker)
-- **Where:** `docker/docker-compose.lite.yml` (default) and `docker/docker-compose.yml` (full, `LITE=0`).
-  The Spark image is `docker/spark/Dockerfile`.
-- **Lite profile (the demo):**
+- **Where:** `docker/docker-compose.yml`. The Spark image is `docker/spark/Dockerfile`.
+- **The containers:**
 
   | Container | Role | UI |
   |---|---|---|
@@ -388,7 +354,6 @@ anomaly-detection-platform/
 | **Kappa architecture** | One streaming path for everything. Reprocessing = replaying the log | The whole design. There's no separate batch pipeline |
 | **Distributed log** | Kafka stores ordered, replayable messages | Kafka UI, topic `flows.raw` |
 | **Partitioning** | Data split into parallel pieces | 12 partitions; key = source IP |
-| **Replication** | Copies on several machines survive a failure | Full cluster: RF=3, min ISR 2 |
 | **Micro-batch streaming** | Process new data every few seconds | Spark UI, Structured Streaming tab |
 | **Exactly-once** | No loss, no duplicates, even after a crash | Checkpoints + Delta transactions + idempotent writes |
 | **Backpressure** | Cap the work per batch | `maxOffsetsPerTrigger`, `maxFilesPerTrigger` |
@@ -422,8 +387,8 @@ anomaly-detection-platform/
   anything unusual, as a safety net for unknown attacks.
 - **Why is the precision so high?** The demo keeps every attack but only 20% of normal traffic, so
   attacks are about 55% of the data. On real traffic, where attacks are rare, precision would be lower.
-- **Why only one Kafka broker and one worker?** It's an 8 GB laptop. With `LITE=0` the same code runs
-  3 brokers with replication and 2 workers.
+- **Why only one Kafka broker and one worker?** It's an 8 GB laptop. On a real cluster the same code
+  would run with more brokers (with replication) and more workers; only the Docker setup changes.
 - **What was hardest?** Making it run reliably on one laptop. Kafka deleted data because of the 2017
   timestamps, executors ran out of memory, and a Delta default created 50 tasks per batch on 2 cores.
   All are documented in [CHECKPOINT.md](CHECKPOINT.md) and the report.

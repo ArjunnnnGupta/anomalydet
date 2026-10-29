@@ -29,7 +29,7 @@ files open in the editor, in this order, and click through them as you talk.
 > "All the settings are in one file: topic names, how many partitions, the window size, the
 > model settings. Every other file reads from here, so nothing is hard-coded."
 
-**2. `docker/docker-compose.lite.yml`: starts the machines**
+**2. `docker/docker-compose.yml`: starts the machines**
 > "This starts Kafka, the Kafka UI, a Spark master and a Spark worker as containers, so one
 > laptop behaves like a small cluster."
 
@@ -107,7 +107,7 @@ files open in the editor, in this order, and click through them as you talk.
 ## The whole flow at a glance
 
 ```
-make cluster-up ─► docker/docker-compose.lite.yml ─► docker/spark/Dockerfile
+make cluster-up ─► docker/docker-compose.yml ─► docker/spark/Dockerfile
 make topics ────► src/ingestion/create_topics.py ─► src/common/config.py ─► conf/pipeline.yaml
 make stream ────► src/streaming/stream_app.py
                     ├─ src/common/spark.py              (builds the SparkSession)
@@ -137,7 +137,7 @@ make report ────► generate_report_da3_pdf.py ─► report_figures.py
 - **Why:**
   - Nobody needs to remember long `docker compose exec … spark-submit --master spark://…` commands.
   - It holds the safety rules, for example `train` refuses to run while the stream is running (the `NO_STREAM` guard), because two Spark drivers don't fit in 6 GB.
-  - It uses `caffeinate` to keep the Mac awake during long runs, and `LITE=1` picks the small cluster by default.
+  - It uses `caffeinate` to keep the Mac awake during long runs.
 
 ### `conf/pipeline.yaml`
 - **What:** the single settings file. It holds:
@@ -154,8 +154,8 @@ make report ────► generate_report_da3_pdf.py ─► report_figures.py
   - `lake("silver_flows")` gives the table path, and `checkpoint("q2_silver")` gives the checkpoint folder;
   - `topic("raw")` gives the topic name;
   - `kafka_bootstrap()` gives the right broker address for inside Docker or on the host;
-  - `replication_factor()` gives 1 on the lite cluster and 3 on the full one;
-  - `trigger()` gives "every 5 seconds", or "drain and stop" (`availableNow`).
+  - `replication_factor()` gives 1 (one broker);
+  - `trigger()` gives "every 5 seconds" (tests switch it to "drain and stop").
 - **Why:** the same code runs in three places: inside Docker, on the Mac, and in tests. This file hides those differences.
 
 ### `requirements.txt`
@@ -166,12 +166,12 @@ make report ────► generate_report_da3_pdf.py ─► report_figures.py
 
 ## Stage 1: Start the cluster (`make cluster-up`)
 
-### `docker/docker-compose.lite.yml` (default) / `docker/docker-compose.yml` (full, `LITE=0`)
-- **What:** defines the containers:
-  - **Kafka** in KRaft mode (1 broker in lite, 3 in full);
+### `docker/docker-compose.yml`
+- **What:** defines the 4 containers:
+  - **Kafka** in KRaft mode (1 broker);
   - **Kafka UI** on port 8080;
   - the **Spark master** on port 8081;
-  - the **Spark worker(s)**.
+  - the **Spark worker**.
 
   The project folder is mounted at `/opt/app` in every Spark container. Memory limits are sized for an 8 GB Mac.
 - **Why:** one command starts a small "cluster" on a laptop. The shared folder acts like the shared storage (HDFS/S3) of a real cluster: the Delta tables, checkpoints and models live there, and every container sees them.
@@ -209,7 +209,7 @@ make report ────► generate_report_da3_pdf.py ─► report_figures.py
   4. starts the **5 streaming queries**: `bronze.start()`, `silver.start()`, `gold.start()` (2 queries) and `scoring.start()`;
   5. waits forever (`awaitAnyTermination`).
 
-  Options: `--only silver` runs a single stage, and `--available-now` drains the backlog and exits (`make stream-catchup`).
+  Option: `--only silver` runs a single stage.
 - **Why:** this is the Kappa idea, *one* program that builds everything continuously. The queries share one set of executors, using a FAIR scheduler so no query starves the others.
 
 ### `src/common/spark.py`
@@ -224,7 +224,7 @@ make report ────► generate_report_da3_pdf.py ─► report_figures.py
 
 ### `src/streaming/metrics_listener.py`
 - **What:** a `StreamingQueryListener`. After **every micro-batch of every query**, it writes rows in, rows/second, batch duration, watermark and Kafka offsets into SQLite `stream_metrics`. It also commits bronze's offsets to a Kafka consumer group, so Kafka UI can show **consumer lag**.
-- **Why:** this is the pipeline's monitoring. The dashboard's "Live pipeline" tab and `make wait` both rely on it.
+- **Why:** this is the pipeline's monitoring. The dashboard's "Pipeline" tab and `make wait` both rely on it.
 
 ### Q1: `src/streaming/bronze.py`
 - **What:** reads Kafka `flows.raw` with `readStream.format("kafka")`, at most 20,000 records per batch (backpressure). It writes the **raw JSON exactly as received**, plus its partition, offset and Kafka timestamp, to Delta `bronze_flows`. It uses `failOnDataLoss=true`.
@@ -304,7 +304,7 @@ make report ────► generate_report_da3_pdf.py ─► report_figures.py
   - **key = source IP**, so one host's flows stay in order on one partition;
   - idempotent producer, `acks=all`, lz4 compression, batching.
 
-  For `make live`, `--speedup` paces the replay, `--rebase` shifts the times to "now", and each run gets a `run_id`. `--inject-bad` sends broken records for the DLQ demo.
+  For `make live`, `--speedup` paces the replay, `--rebase` shifts the times to "now", and each run gets a `run_id`.
 - **Why:** there's no real network to watch, so this program **pretends to be one**. It's the only way data enters (Kappa).
 
 ### `src/ingestion/wait_caught_up.py` (`make wait`)
@@ -328,7 +328,7 @@ make report ────► generate_report_da3_pdf.py ─► report_figures.py
 
 ### `src/ml/evaluate.py` (`make evaluate`, `make evaluate-live`)
 - **What:** computes macro-F1, per-class precision/recall, ROC-AUC and a confusion matrix, all with Spark `groupBy` and `BinaryClassificationEvaluator`. It runs on the held-out test predictions, or with `--live` on the flows the stream really scored. Results are saved as `metrics.json` / `metrics_live.json` plus PNG plots in the registry.
-- **Why:** this proves the model works on data it never saw. The dashboard's "Lakehouse & model" tab and the report read these files.
+- **Why:** this proves the model works on data it never saw. The dashboard's "Model & hosts" tab and the report read these files.
 
 ---
 
@@ -341,14 +341,12 @@ There are no new files here. `replay_producer.py` runs again with `--split live 
 ## Stage 7: Show it (`make dashboard`)
 
 ### `src/dashboard/app.py`
-- **What:** a Streamlit web app (http://localhost:8501) running on the Mac, with 5 tabs:
-  - **Live pipeline:** throughput, batch times, Kafka lag per partition, and whether the stream is up (via the Spark master REST API).
-  - **Threat timeline:** alerts per minute by family, plus precision/recall.
-  - **Hosts:** top attackers and port scanners.
-  - **Alert feed:** each alert with ✅/❌ against the true label.
-  - **Lakehouse & model:** Delta table versions, model metrics and plots.
+- **What:** a Streamlit web app (http://localhost:8501) running on the Mac, with 3 tabs:
+  - **📡 Pipeline:** whether the stream is up (via the Spark master REST API), rows/s per query and Kafka lag per partition.
+  - **🚨 Alerts:** the 4 headline numbers (flows scored, alerts, precision, recall), alerts per minute and the latest alerts with ✅/❌.
+  - **🧠 Model & hosts:** model metrics (held-out or live), port-scan suspects and top attacking IPs.
 
-  It reads SQLite, the Delta tables directly with **delta-rs** (no Spark needed), the registry's JSON files, and Kafka for lag.
+  It reads SQLite, the `gold_scored` Delta table directly with **delta-rs** (no Spark needed), the registry's JSON files, and Kafka for lag.
 - **Why:** this is the screen a security analyst would use, and the centrepiece of the demo.
 
 ---
@@ -392,7 +390,6 @@ There are no new files here. `replay_producer.py` runs again with `--split live 
 |---|---|
 | `generate_report_da3_pdf.py` | Turns `REPORT.md` into `Digital_Assignment_3_Report.pdf` in the VIT format: cover page with the logo from `assets/vit_logo.png`, page borders, Times, tables and figures |
 | `report_figures.py` | Redraws the 8 report charts from the **current** Delta tables, SQLite and model metrics, so the figures always match the data |
-| `generate_report_pdf.py` | The old Review-2 (DA2) report generator (`make report-da2`), kept for reference |
 
 ---
 

@@ -11,7 +11,7 @@ submitted: Dr. Dharini R; SCOPE
 
 ## Abstract
 
-This project builds a real-time Big Data Analytics platform for network intrusion detection on the CICIDS2017 dataset. The original GeneratedLabelledFlows data (8 CSV files, 2,830,743 labelled network flows captured from 3 to 7 July 2017) is replayed through Apache Kafka. For the demonstration every attack flow and 20% of the benign flows are kept, giving 1,012,310 flows. The design follows a Kappa architecture: Kafka is the only way data enters, and one Spark Structured Streaming application with five queries builds a Delta Lake medallion lakehouse (bronze, silver, gold), computes 1-minute windowed aggregates and port-scan candidates, and scores live traffic with Spark MLlib models. A RandomForest classifier reached a macro-F1 of 0.907 and an accuracy of 99.48% on 162,029 held-out flows. On 27,099 live flows that were never used in training, 99.2% of alerts were real attacks and 99.2% of attacks raised an alert. The registered model is hot-swapped into the running stream without a restart, and the results are served through SQLite to a five-tab Streamlit dashboard. The platform runs on a single 8 GB laptop under Docker, so the results demonstrate a working pipeline rather than production-scale performance.
+This project builds a real-time Big Data Analytics platform for network intrusion detection on the CICIDS2017 dataset. The original GeneratedLabelledFlows data (8 CSV files, 2,830,743 labelled network flows captured from 3 to 7 July 2017) is replayed through Apache Kafka. For the demonstration every attack flow and 20% of the benign flows are kept, giving 1,012,310 flows. The design follows a Kappa architecture: Kafka is the only way data enters, and one Spark Structured Streaming application with five queries builds a Delta Lake medallion lakehouse (bronze, silver, gold), computes 1-minute windowed aggregates and port-scan candidates, and scores live traffic with Spark MLlib models. A RandomForest classifier reached a macro-F1 of 0.907 and an accuracy of 99.48% on 162,029 held-out flows. On 57,414 live flows that were never used in training, 99.2% of alerts were real attacks and 99.7% of attacks raised an alert. The registered model is hot-swapped into the running stream without a restart, and the results are served through SQLite to a three-tab Streamlit dashboard. The platform runs on a single 8 GB laptop under Docker, so the results demonstrate a working pipeline rather than production-scale performance.
 
 ## 1. Problem Statement
 
@@ -24,14 +24,14 @@ The project replays the CICIDS2017 flows through Apache Kafka, processes them wi
 | Component | Planned purpose | Final implementation / status |
 |---|---|---|
 | Data ingestion | Stream flow records into the platform | Completed: replay producer, 1,012,310 flows sent to Kafka (809,632 backfill + 202,678 live) |
-| Message broker | Durable, partitioned transport | Completed: KRaft Kafka, 4 topics; 1 broker for the demo, 3 brokers with replication factor 3 in the full profile |
+| Message broker | Durable, partitioned transport | Completed: KRaft Kafka (1 broker), 4 topics, 12 partitions for raw flows |
 | Stream processing | Continuous parsing and cleaning | Completed: Spark Structured Streaming, 5 queries in one application |
 | Lakehouse storage | Reliable storage with history | Completed: Delta Lake bronze / silver / gold, 8 tables, time travel |
 | Data quality | Catch malformed records | Completed: DQ rules, quarantine table and Kafka dead-letter topic |
 | Windowed analytics | Time-based traffic summaries | Completed: 1-minute windows, 10-minute watermark, port-scan detection |
 | Machine learning | Classify flows into attack families | Completed: MLlib RandomForest + KMeans, macro-F1 0.907 |
-| Real-time scoring | Score live traffic as it arrives | Completed: 27,099 live flows scored, 12,649 alerts, model hot reload |
-| Dashboard | Present results interactively | Completed: Streamlit dashboard, five tabs |
+| Real-time scoring | Score live traffic as it arrives | Completed: 57,414 live flows scored, 33,719 alerts, model hot reload |
+| Dashboard | Present results interactively | Completed: Streamlit dashboard, three tabs |
 
 ## 3. Methodology
 
@@ -83,24 +83,24 @@ Hourly flow counts follow the CICIDS2017 attack schedule. Normal traffic stays b
 
 ### 4.4 Kafka Ingestion and Streaming Throughput
 
-All flows enter through Kafka. The producer is idempotent, waits for all in-sync replicas (acks=all), compresses with lz4 and keys each message by source IP, so all flows from one host land in the same partition and stay in order. The demo runs on the lite profile (one broker, replication factor 1); the full profile uses three brokers with replication factor 3 and `min.insync.replicas=2`.
+All flows enter through Kafka. The producer is idempotent, waits for all in-sync replicas (acks=all), compresses with lz4 and keys each message by source IP, so all flows from one host land in the same partition and stay in order. The cluster has one broker to fit on the laptop, so each partition has one copy (replication factor 1); a multi-machine cluster would add brokers and replication with no code changes.
 
-| Topic | Partitions | Replication (lite / full) | Purpose |
+| Topic | Partitions | Replication | Purpose |
 |---|---|---|---|
-| flows.raw | 12 | 1 / 3 | Raw flow records from the producer |
-| flows.scored | 6 | 1 / 3 | Every live flow with its prediction |
-| alerts | 3 | 1 / 3 | Flows that triggered an alert |
-| flows.dlq | 1 | 1 / 3 | Dead-letter queue for malformed records |
+| flows.raw | 12 | 1 | Raw flow records from the producer |
+| flows.scored | 6 | 1 | Every live flow with its prediction |
+| alerts | 3 | 1 | Flows that triggered an alert |
+| flows.dlq | 1 | 1 | Dead-letter queue for malformed records |
 
 The StreamingQueryListener records the progress of every micro-batch. The table below shows the batches that carried input during the live replays. The producer paces live traffic to a fixed speed-up of real time, so these rates follow the replay rate rather than the cluster's limit.
 
 | Query | Batches | Rows | Avg rows/s | Peak rows/s |
 |---|---|---|---|---|
-| Q1 bronze (Kafka → Delta) | 59 | 64,530 | 36 | 185 |
-| Q2 silver (parse, DQ, enrich) | 43 | 63,582 | 32 | 219 |
-| Q3a gold timeline | 20 | 46,061 | 34 | 189 |
-| Q3b gold hosts | 17 | 37,348 | 46 | 244 |
-| Q4 scoring | 18 | 34,838 | 38 | 169 |
+| Q1 bronze (Kafka → Delta) | 11 | 30,235 | 70 | 235 |
+| Q2 silver (parse, DQ, enrich) | 9 | 34,656 | 62 | 191 |
+| Q3a gold timeline | 7 | 58,782 | 110 | 293 |
+| Q3b gold hosts | 7 | 66,445 | 164 | 437 |
+| Q4 scoring | 8 | 68,234 | 147 | 258 |
 
 ![Average and peak throughput per streaming query.](data/report_figures/fig4_throughput.png)
 
@@ -118,13 +118,13 @@ Each layer is a Delta table, so every write is an ACID transaction with a versio
 
 | Layer | Table | Rows | Delta version |
 |---|---|---|---|
-| Bronze | flows | 1,279,518 | 125 |
-| Silver | flows | 1,274,985 | 65 |
+| Bronze | flows | 1,309,753 | 137 |
+| Silver | flows | 1,309,640 | 74 |
 | Silver | quarantine | 37 | 15 |
-| Gold | attack_timeline | 2,641 | 38 |
-| Gold | host_profile | 70,466 | 29 |
-| Gold | port_scan_candidates | 102 | 13 |
-| Gold | scored_flows | 27,099 | 11 |
+| Gold | attack_timeline | 2,579 | 46 |
+| Gold | host_profile | 62,964 | 37 |
+| Gold | port_scan_candidates | 86 | 18 |
+| Gold | scored_flows | 57,414 | 19 |
 | Gold | model_predictions | 162,029 | 0 |
 
 ### 4.6 Machine Learning with Spark MLlib
@@ -151,16 +151,16 @@ The scoring query skips batches until a model exists, then loads the newest regi
 
 | Measure | Value |
 |---|---|
-| Live flows scored | 27,099 |
-| Real attacks among them | 12,647 |
-| Alerts raised | 12,649 |
-| Alert precision / recall | 99.19% / 99.21% |
-| Predicted family = true family | 99.46% |
-| Alert reason: RandomForest / both / KMeans only | 12,459 / 131 / 59 |
-| False-positive alerts (true family Normal) | 102 (0.81%) |
+| Live flows scored | 57,414 |
+| Real attacks among them | 33,570 |
+| Alerts raised | 33,719 |
+| Alert precision / recall | 99.25% / 99.69% |
+| Predicted family = true family | 99.49% |
+| Alert reason: RandomForest / both / KMeans only | 33,468 / 118 / 133 |
+| False-positive alerts (true family Normal) | 253 (0.75%) |
 | Model version | v1 (hot-loaded without a restart) |
 
-Several live replays were run while the pipeline was being tuned; the scoring query skipped the backlog from those runs, so the scored table covers the 27,099 flows scored in the final runs. These flows were never used in training, so the live numbers are a genuine held-out evaluation.
+The scored table covers the final demo run (30,235 new live flows) plus about 27,000 live flows that an earlier practice run had cleaned but not yet scored, which the scoring query processed first. These flows were never used in training, so the live numbers are a genuine held-out evaluation.
 
 ![Live alerts by true family and predicted family (log scale).](data/report_figures/fig7_live_alerts.png)
 
@@ -170,10 +170,10 @@ The gold host query counts, for each source IP and 1-minute window, the flows an
 
 | Measure | Value |
 |---|---|
-| Attack-timeline windows | 2,641 |
-| Per-host window rows | 70,466 |
-| Port-scan candidate windows | 102 |
-| Distinct source IPs flagged | 9 |
+| Attack-timeline windows | 2,579 |
+| Per-host window rows | 62,964 |
+| Port-scan candidate windows | 86 |
+| Distinct source IPs flagged | 7 |
 
 172.16.0.1, the address the attacker's traffic arrives from inside the CICIDS2017 testbed, touched up to 1,034 ports in one minute. Some public IPs with a single flagged window are likely false positives of the simple threshold rule.
 
@@ -183,7 +183,7 @@ The gold host query counts, for each source IP and 1-minute window, the flows an
 
 | Concept | Application in the Project |
 |---|---|
-| Distributed messaging | Kafka with 12 partitions keyed by source IP, idempotent producer, replication factor 3 in the full profile. |
+| Distributed messaging | Kafka with 12 partitions keyed by source IP and an idempotent producer. |
 | Kappa architecture | One streaming path; backfill and live data are both replayed through Kafka. |
 | Stream processing | Spark Structured Streaming micro-batches with checkpoints and backpressure (maxOffsetsPerTrigger, maxFilesPerTrigger). |
 | Exactly-once processing | Kafka offsets in checkpoints, Delta transactional sinks and idempotent writes (txnAppId / txnVersion). |
@@ -211,7 +211,7 @@ What the team learned:
 | Kafka deleted data because records carried 2017 timestamps | Records use the send time; bronze fails loudly on data loss (failOnDataLoss=true). |
 | Executor out of memory on the partitioned bronze write | Unpartitioned bronze, smaller batches and explicit memory caps. |
 | Streaming app killed by Docker (out of memory) | Rate limits on every Delta stream source, a cap on direct memory, two small executors, and no batch job alongside the stream. |
-| Slow, hot laptop on the full replay | All attacks kept, benign flows sampled to 20%, the single-broker lite profile and a sampled live replay. |
+| Slow, hot laptop on the full replay | All attacks kept, benign flows sampled to 20%, a single-broker cluster and a sampled live replay. |
 | Silver deduplication re-scanned the whole table each batch | Replaced the MERGE with Delta idempotent append; gold MERGEs got partition-pruning and file-skipping predicates. |
 | Writes silently skipped after a checkpoint reset | The idempotent-write ID now includes the streaming query's unique ID. |
 | CPU starvation from a Delta default (50 snapshot tasks) | spark.databricks.delta.snapshotPartitions set to 4. |
@@ -220,7 +220,7 @@ What the team learned:
 
 ## 7. Conclusion and Future Scope
 
-The platform streams about 1.01 million CICIDS2017 flows through Kafka into a Delta Lake lakehouse with Spark Structured Streaming, trains a RandomForest with macro-F1 0.907 using Spark MLlib, scores live traffic with a model that can be swapped without a restart, and presents the results through a Streamlit dashboard. On held-out live traffic, 99.2% of alerts were real attacks and 99.2% of attacks were caught. The results come from one laptop and a downsampled dataset, and are best read as a working demonstration of the pipeline.
+The platform streams about 1.01 million CICIDS2017 flows through Kafka into a Delta Lake lakehouse with Spark Structured Streaming, trains a RandomForest with macro-F1 0.907 using Spark MLlib, scores live traffic with a model that can be swapped without a restart, and presents the results through a Streamlit dashboard. On held-out live traffic, 99.2% of alerts were real attacks and 99.7% of attacks were caught. The results come from one laptop and a downsampled dataset, and are best read as a working demonstration of the pipeline.
 
 Future Scope –
 

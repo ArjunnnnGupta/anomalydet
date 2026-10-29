@@ -18,10 +18,10 @@ dataset:
   benign_pct: 20                        # keep 20% of BENIGN rows and every attack row (~1.0M of 2.83M flows)
 
 kafka:
-  bootstrap_internal: kafka-1:19092,kafka-2:19092,kafka-3:19092   # inside the Docker network
-  bootstrap_external: localhost:9092,localhost:9094,localhost:9096  # from the host (producer, dashboard)
-  replication_factor: 3                 # overridden to 1 by KAFKA_RF=1 for the lite profile
-  min_insync_replicas: 2
+  bootstrap_internal: kafka-1:19092     # inside the Docker network
+  bootstrap_external: localhost:9092    # from the host (producer, dashboard)
+  replication_factor: 1                 # one broker, so one copy of each partition
+  min_insync_replicas: 1
   topics:
     raw:     {name: flows.raw,    partitions: 12, retention_bytes: 268435456}   # 256 MB per partition
     scored:  {name: flows.scored, partitions: 6,  retention_bytes: 134217728}
@@ -76,11 +76,9 @@ ml:
   train_fraction: 0.8
   seed: 42
   rf:
-    num_trees: [50]
-    max_depth: [10, 14]
+    num_trees: 50
+    max_depth: 10
     max_bins: 64
-    cv_folds: 2
-    cv_parallelism: 2
   kmeans:
     k: 8
     max_iter: 20

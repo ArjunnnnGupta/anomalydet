@@ -390,3 +390,15 @@ The headless render of all tabs on the current data showed no exceptions. It did
 - The report now matches the team's reference layout (`BigData_DA3_Report.pdf`): US Letter pages, a border on every page, Times New Roman, a VIT cover page (logo in `assets/vit_logo.png`, team and guide from the front matter of REPORT.md), black-grid tables, inline "Figure N:" captions, and the sections Abstract, 1–7.
 - New `report_figures.py` redraws the 8 figures from the current lake with delta-rs: architecture, families, hourly activity, throughput, F1 per class, feature importance, live alerts and port scans. `make report` runs it first, so the charts always match the data.
 - The numbers are current and verified. Live: 27,099 scored flows, 12,649 alerts, precision 99.19% and recall 99.21%, 102 false positives. The Kafka section shows the lite/full replication factors (1/3) instead of claiming 3 brokers. 13 pages; every page was rendered and checked.
+
+---
+
+## Checkpoint 22: Simple version in its own folder (2026-10-29)
+
+The user wanted a simpler project. The simplified version lives in **`../anomaly-detection-simple`**: a git worktree on branch **`simple-pipeline`**. The original folder and the `kappa-streaming-pipeline` branch are untouched.
+
+- **Shared, not copied:** `data/` and `venv/` are relative symlinks to `../anomaly-detection-platform`. The compose file adds a second mount (`../../anomaly-detection-platform:/opt/anomaly-detection-platform`) so the symlink also resolves inside the containers, which was verified with a throwaway container. Both folders drive the same Docker containers and lake, so run only one at a time.
+- **One cluster size:** the 3-broker compose file is gone. The lite file is now `docker/docker-compose.yml`, and the LITE switch and the KAFKA_RF/KAFKA_BOOTSTRAP overrides are removed. `pipeline.yaml` has 1 broker, RF 1.
+- **Fewer commands:** removed `topics-describe`, `stream-bg`, `stream-logs`, `stream-catchup`, `inject-bad`, `report-da2`, the old DA2 report script, `train --cv` (CrossValidator) and `stream_app --available-now`. `bad_records()` and the `STREAM_AVAILABLE_NOW` switch stay, because the tests use them.
+- **Dashboard: 3 tabs:** Pipeline (status, rows/s, Kafka lag), Alerts (4 headline numbers, alerts per minute, latest alerts ✅/❌), Model & hosts (metrics, port-scan suspects, top hosts). It renders headlessly with no exceptions.
+- **Docs and report** were updated to match. The report numbers were recomputed from the current lake: 57,414 live flows scored, 33,719 alerts, precision 99.25%, recall 99.69%.

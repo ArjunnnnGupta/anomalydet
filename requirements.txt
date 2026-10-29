@@ -13,4 +13,4 @@ matplotlib>=3.9
 pyyaml>=6.0
 setuptools             # distutils shim PySpark 3.5 needs on Python 3.12+
 pytest>=8
-reportlab              # only for `make report` (generate_report_pdf.py)
+reportlab              # only for `make report` (generate_report_da3_pdf.py)

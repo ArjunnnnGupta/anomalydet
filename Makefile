@@ -10,20 +10,11 @@
 #   make stream  /  make live               # terminal 1 / 2: real-time scoring of a held-out sample
 #   make dashboard                          # terminal 3: http://localhost:8501
 #
-# Default is the LITE profile (1 Kafka broker, 1 Spark worker), sized for an 8 GB Mac.
-# LITE=0 (e.g. `make cluster-up LITE=0`) switches every target to the 3-broker / 2-worker cluster.
+# Cluster: 1 Kafka broker + 1 Spark worker (docker/docker-compose.yml), sized for an 8 GB Mac.
 
 VENV    := venv
 PY      := $(VENV)/bin/python
-LITE    ?= 1
-
-ifeq ($(LITE),1)
-  COMPOSE := docker compose -f docker/docker-compose.lite.yml
-  export KAFKA_RF := 1
-  export KAFKA_BOOTSTRAP := localhost:9092
-else
-  COMPOSE := docker compose -f docker/docker-compose.yml
-endif
+COMPOSE := docker compose -f docker/docker-compose.yml
 
 # SKIP_BACKLOG=1: queries with no checkpoint start at their source table's current end (see src/common/lake.py)
 SKIP_ENV = $(if $(SKIP_BACKLOG),-e STREAM_SKIP_BACKLOG=1)
@@ -38,12 +29,10 @@ SPEEDUP    ?= 300
 LIVE_PCT   ?= 15
 # Keep the Mac awake while long pipeline commands run (a sleep killed the stream once)
 CAFF := $(shell command -v caffeinate >/dev/null 2>&1 && echo caffeinate -i)
-INJECT_BAD ?= 50
 ARGS       ?=
 
-.PHONY: help setup test build cluster-up cluster-down cluster-ps logs topics topics-describe \
-        stream stream-bg stream-logs stream-catchup produce backfill live inject-bad wait train evaluate \
-        evaluate-live maintenance dashboard report report-da2 demo-reset reset
+.PHONY: help setup test build cluster-up cluster-down cluster-ps logs topics \
+        stream backfill live wait train evaluate evaluate-live maintenance dashboard report demo-reset reset
 
 help:
 	@grep -E '^## ' Makefile | sed 's/## //'
@@ -61,7 +50,7 @@ test:
 build:
 	$(COMPOSE) build
 
-## cluster-up       start Kafka brokers, Kafka UI, Spark master + workers
+## cluster-up       start Kafka, Kafka UI, Spark master + worker
 cluster-up:
 	$(COMPOSE) up -d
 	@echo "Kafka UI      http://localhost:8080"
@@ -80,27 +69,10 @@ logs:
 topics:
 	$(PY) -m src.ingestion.create_topics $(ARGS)
 
-topics-describe:
-	$(PY) -m src.ingestion.create_topics --describe
-
 # ── Streaming (Kappa) ─────────────────────────────────────────────────────────
 ## stream           run the always-on streaming app (Q1–Q4) in the foreground
 stream:
 	$(call SUBMIT,) --driver-memory 768m /opt/app/src/streaming/stream_app.py $(ARGS)
-
-## stream-bg        same, detached; output in data/logs/stream_app.log (make stream-logs)
-stream-bg:
-	mkdir -p data/logs
-	$(COMPOSE) exec -d $(SKIP_ENV) spark-master sh -c "spark-submit --master spark://spark-master:7077 \
-	  --driver-memory 768m /opt/app/src/streaming/stream_app.py $(ARGS) > /opt/app/data/logs/stream_app.log 2>&1"
-	@echo "Streaming app started in the background → data/logs/stream_app.log"
-
-stream-logs:
-	tail -f data/logs/stream_app.log
-
-## stream-catchup   drain everything available stage by stage, then exit
-stream-catchup:
-	$(call SUBMIT,) --driver-memory 768m /opt/app/src/streaming/stream_app.py --available-now
 
 ## backfill         replay the ~80% backfill split at full speed (historical timestamps)
 backfill:
@@ -109,10 +81,6 @@ backfill:
 ## live             replay a LIVE_PCT% sample of the held-out flows at SPEEDUP× event time (LIVE_PCT=100: all)
 live:
 	$(CAFF) $(PY) -m src.ingestion.replay_producer --split live --sample-pct $(LIVE_PCT) --speedup $(SPEEDUP) $(ARGS)
-
-## inject-bad       send INJECT_BAD malformed records (→ quarantine + flows.dlq)
-inject-bad:
-	$(PY) -m src.ingestion.replay_producer --inject-bad $(INJECT_BAD) --bad-only
 
 ## wait             block until the stream has consumed every Kafka message and silver is idle
 wait:
@@ -146,10 +114,6 @@ dashboard:
 ## report           build Digital_Assignment_3_Report.pdf (VIT format) from REPORT.md + figures redrawn from the lake
 report:
 	$(PY) generate_report_da3_pdf.py
-
-## report-da2       regenerate the old Review-2 PDF (hardcoded text)
-report-da2:
-	$(PY) generate_report_pdf.py
 
 
 ## demo-reset       fresh demo: clear previous live results + empty Kafka (keeps model and backfill)

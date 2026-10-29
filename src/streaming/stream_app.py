@@ -13,7 +13,6 @@ Restart-safe: every query resumes from its own checkpoint under data/checkpoints
 """
 
 import argparse
-import os
 
 from src.common.spark import get_spark
 from src.serving import sqlite_sink
@@ -26,12 +25,8 @@ STAGES = ["bronze", "silver", "gold", "scoring"]
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*", choices=STAGES, help="start a subset of the queries")
-    ap.add_argument("--available-now", action="store_true",
-                    help="drain everything currently available, then stop (catch-up mode)")
     args = ap.parse_args()
     stages = [s for s in STAGES if s in (args.only or STAGES)]   # always upstream → downstream
-    if args.available_now:
-        os.environ["STREAM_AVAILABLE_NOW"] = "1"
 
     spark = get_spark("kappa-stream-app", streaming=True)
     spark.streams.addListener(MetricsListener())
@@ -44,16 +39,6 @@ def main():
 
     starters = {"bronze": bronze.start, "silver": silver.start, "gold": gold.start,
                 "scoring": scoring.start}
-
-    if args.available_now:
-        # Each stage reads the Delta table its upstream writes, so drain them in order
-        for name in stages:
-            started = starters[name](spark)
-            for q in started if isinstance(started, list) else [started]:
-                q.awaitTermination()
-                print(f"  ✓ {q.name} drained", flush=True)
-        spark.stop()   # flush the listener bus while the Python side is still alive
-        return
 
     queries = []
     for name in stages:

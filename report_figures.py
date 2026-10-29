@@ -92,7 +92,7 @@ def architecture():
     rows = [55, 46, 37, 28, 19]
     box(c1, rows[0], w, h, "CICIDS2017 CSVs\n(8 files, 2.83M labelled flows)", "#c6d8ec")
     box(c1, rows[1], w, h, "Replay Producer\n(idempotent, lz4, keyed by Source IP)", "#cfe9f5")
-    box(c1, rows[2], w, h, "Apache Kafka (KRaft)\n(flows.raw: 12 partitions)", "#93c6f2")
+    box(c1, rows[2], w, h, "Apache Kafka (KRaft, 1 broker)\n(flows.raw: 12 partitions)", "#93c6f2")
     box(c1, rows[3], w, h, "Spark Structured Streaming\n(Q1 bronze, Q2 silver)", "#bfe5d6")
     box(c1, rows[4], w, h, "Delta Lake Medallion\n(bronze / silver / gold)", "#f0e8c4")
     box(c2, rows[3], w, h, "Q3a / Q3b Gold Windows\n(1-min timeline, per-host,\nport-scan candidates)", "#bfe5d6")
@@ -101,7 +101,7 @@ def architecture():
     box(c3, rows[3], w, h, "Model Registry\n(versioned, latest.json)", "#e5e5e5")
     box(c3, rows[4], w, h, "Kafka output topics\n(flows.scored, alerts, flows.dlq)", "#93c6f2")
     box(c1, 4, c3 + w - c1, h, "SQLite Serving Cache  →  Streamlit Dashboard "
-                               "(Live pipeline · Threat timeline · Hosts · Alert feed · Lakehouse & model)", "#f1b8a6")
+                               "(Pipeline · Alerts · Model & hosts)", "#f1b8a6")
     mid = c1 + w / 2
     for a, b in zip(rows, rows[1:]):
         arrow(mid, a, mid, b + h)
