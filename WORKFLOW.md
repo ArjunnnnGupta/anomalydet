@@ -1,7 +1,8 @@
 # How the Project Works: Simple Workflow
 
 This explains the project step by step in plain words: what happens at each step, and **why** that
-step is needed. Difficult terms are explained in the glossary at the end.
+step is needed. After the steps there's a worked **example** that follows one attack all the way from
+the CSV file to the dashboard. Difficult terms are explained in the glossary at the end.
 
 ---
 
@@ -225,6 +226,126 @@ would actually see and act on the attacks.
 
 **Why SQLite in between:** the dashboard refreshes every few seconds. Reading a small, simple
 database is fast, while asking Spark each time would be slow.
+
+---
+
+## Example: following one attack through the whole system
+
+Let's follow **one real kind of attack** from the dataset, step by step. On Friday afternoon in
+CICIDS2017, an attacker ran a **port scan**: one computer knocks on hundreds of "doors" (ports) of
+another computer to see which ones are open. Every knock is one network flow.
+
+> The values below are simplified so they're easy to follow, but every step is exactly what the
+> code does.
+
+### 1. The flow starts as one line in a CSV file
+
+```
+Source IP: 172.16.0.1   Destination IP: 192.168.10.50   Destination Port: 22
+Flow Duration: 45  ...(about 80 numbers)...  Label: PortScan
+```
+In plain words: computer `172.16.0.1` touched port 22 (SSH) on `192.168.10.50` for a split second.
+
+### 2. The producer sends it into Kafka
+
+`make live` reads that line and turns it into a message:
+- **key** = `172.16.0.1` (the source IP),
+- **value** = the whole row as JSON, plus `split: "live"` (this flow was hidden from training).
+
+Because the key is the source IP, **all flows from this attacker go to the same partition**, so they
+stay in order. The time is shifted to "now", so on the dashboard the attack looks like it's happening
+live.
+
+### 3. Kafka holds it
+
+The message waits in topic `flows.raw`, say in partition 7 at position (offset) 51,204. If Spark were
+busy or restarting, the message would simply wait there; nothing is lost.
+
+### 4. `q1_bronze` saves the raw copy
+
+Within 5 seconds, Spark picks up the message and saves it **unchanged** in the bronze table, together
+with where it came from (`partition 7, offset 51204`). Spark's checkpoint now says "partition 7 is
+done up to 51,204", so this message will never be read twice.
+
+### 5. `q2_silver` cleans it
+
+The JSON text becomes proper columns:
+
+| Column | Value |
+|---|---|
+| `event_time` | 2026-10-29 14:32:05 (a real timestamp now, not text) |
+| `src_ip` → `dst_ip` : `dst_port` | 172.16.0.1 → 192.168.10.50 : 22 |
+| `label_family` | **Port Scanning** (the raw label `PortScan` tidied into a group) |
+| `dst_zone` | internal (the victim is inside the company network) |
+| `service` | SSH (port 22) |
+| `flow_uid` | a unique fingerprint, so this flow can never be saved twice |
+
+It passes all the quality checks (it has a time and a valid duration), so it goes to **silver**. A
+broken record would have gone to **quarantine** instead.
+
+### 6. Three queries read the clean flow at the same time
+
+**`q3a_gold_timeline`** adds it to the count for that minute:
+```
+14:32 – 14:33   Port Scanning   flows: 1,860
+```
+
+**`q3b_gold_hosts`** adds it to this attacker's activity for that minute:
+```
+172.16.0.1   14:32 – 14:33   flows: 1,860   different ports touched: 980
+```
+980 is more than the 50-port limit, so `172.16.0.1` is listed as a **port-scan suspect**. Note that
+this works by counting, even without the ML model.
+
+**`q4_scoring`** gives the flow to the trained models:
+- **RandomForest:** "this looks like Port Scanning, 97% sure". That's ≥ 60%, so it's an attack.
+- **KMeans:** "this is far away from normal traffic" (distance higher than 26.85).
+
+Either one is enough, so an **alert** is raised. It's tagged with the model version (`v1`).
+
+### 7. The results are saved in several places
+
+| Where | Why |
+|---|---|
+| Delta `gold_scored` | the permanent record of every scored flow, used later to measure accuracy |
+| Kafka topic `alerts` | so any other system (an email or SMS alerter, a firewall) could react to it |
+| SQLite `alerts` | a small, fast copy that the dashboard reads |
+
+### 8. The dashboard shows it
+
+A few seconds later, in http://localhost:8501:
+- **Threat timeline:** the "Port Scanning" line jumps up at 14:32.
+- **Hosts:** `172.16.0.1` is at the top of the port-scan suspects.
+- **Alert feed:** a new row says `172.16.0.1 → 192.168.10.50:22 · Port Scanning · 97%` with a ✅,
+  because the real label really was PortScan, so the model was right.
+- **Live pipeline:** shows the batch being processed and the Kafka lag going back to 0.
+
+### The whole journey at a glance
+
+```
+CSV line ─► producer ─► Kafka (partition 7) ─► q1_bronze (raw copy)
+   │                                              │
+   │ "172.16.0.1 touched port 22"                 ▼
+   │                                          q2_silver (clean columns, "Port Scanning")
+   │                                    ┌─────────┼──────────────┐
+   │                                    ▼         ▼              ▼
+   │                               q3a timeline  q3b hosts    q4_scoring
+   │                               (+1 at 14:32) (980 ports → (RF 97% → ALERT)
+   │                                              suspect)       │
+   │                                    └─────────┼──────────────┘
+   ▼                                              ▼
+ a few seconds later ──────────────────────► Dashboard: line spikes, host flagged, ✅ alert
+```
+
+From one line in a file to an alert on screen takes **a few seconds**, and the same path runs
+for every one of the ~1 million flows.
+
+### And a normal flow?
+
+A normal web visit (say `192.168.10.5 → 8.8.8.8:443`) takes exactly the same path. The difference is
+at the end: RandomForest says "Normal, 99%", and KMeans says it's close to normal traffic. So **no
+alert** is raised. The flow is still counted in the timeline and host tables and still saved in
+`gold_scored`.
 
 ---
 
