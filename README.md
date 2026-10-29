@@ -33,6 +33,7 @@ a newly registered version without a code change or redeploy.
          (RandomForest + KMeans, model registry) ─► SQLite serving cache ─► Streamlit dashboard
 ```
 
+A one-picture flowchart of the files and where data is stored is in **[DATA_FLOW.md](DATA_FLOW.md)**.
 The simplest starting point is **[WORKFLOW.md](WORKFLOW.md)**: the step-by-step flow and a glossary of terms.
 The program traced file by file, in the order it runs, is in **[FILE_FLOW.md](FILE_FLOW.md)**, and the bronze/silver/gold code is explained line by line in **[MEDALLION_CODE.md](MEDALLION_CODE.md)**.
 A plain-language walkthrough of every component (what, where, why, which big data concept) is in
